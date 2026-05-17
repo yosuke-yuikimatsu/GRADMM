@@ -95,6 +95,20 @@ def get_args(argv=None):
         '--grad_clip', type=float, default=None
     )   # TAG best: 1, ours 0.5, only applicable to BERT_Large
     parser.add_argument('--lr_max_it', type=int, default=None)
+    parser.add_argument(
+        '--embed_value_clip',
+        type=float,
+        default=None,
+        help='optional ADMM debugging/stability clamp for x/z/lambda embeddings',
+    )
+    parser.add_argument(
+        '--force_float32_model',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=False,
+        help='load the LM with torch.float32 for numerical debugging at higher VRAM cost',
+    )
 
     # Debug params
     parser.add_argument('--print_every', type=int, default=10)

@@ -20,6 +20,8 @@ from distribution_matching import build_dm_projectors, compute_dm_loss
 from init import get_init_lm
 from utilities import (
     align_embeds_to_model,
+    assert_finite_scalar,
+    assert_finite_tensor,
     compute_grads_lm,
     cos_sim,
     count_lines,
@@ -42,6 +44,44 @@ from utilities import (
 
 
 unused_tokens = None
+
+
+def init_empty_run_state(args):
+    summary_metrics = {
+        "mean_perplexity": None,
+        "mean_rec_loss": None,
+        "mean_tot_loss": None,
+        "perplexity": [],
+        "rec_loss_embeds": [],
+        "rec_loss_ids": [],
+        "tot_loss": [],
+        "embed_diff_ids": [],
+    }
+    pos_generations = []
+    neg_generations = []
+    return summary_metrics, pos_generations, neg_generations
+
+
+def _copy_prompt_embeddings(x_embeds, prompt_embeddings, prompt_len, first_prompt_end_index):
+    with torch.no_grad():
+        if isinstance(prompt_embeddings, list):
+            x_embeds[
+                :,
+                first_prompt_end_index - prompt_len[0] : first_prompt_end_index,
+                :,
+            ].copy_(prompt_embeddings[0].detach())
+            x_embeds[:, -prompt_len[1] :, :].copy_(prompt_embeddings[1].detach())
+        else:
+            x_embeds[:, -prompt_len:, :].copy_(prompt_embeddings.detach())
+
+
+def _maybe_clip_embeddings(args, *tensors):
+    if getattr(args, "embed_value_clip", None) is None:
+        return
+    with torch.no_grad():
+        for tensor in tensors:
+            if tensor is not None:
+                tensor.clamp_(-args.embed_value_clip, args.embed_value_clip)
 
 
 def get_loss(
@@ -210,12 +250,20 @@ def generation(
         # the final tokens are never used
         for i in range(tokenizer.vocab_size, lm_embeddings.weight.shape[0]):
             unused_tokens.append(i)
-        unused_tokens.append(tokenizer.pad_token_id)
-        unused_tokens.append(tokenizer.eos_token_id)
-        # Remove tokens that contain special characters
+        for special_id in [
+            tokenizer.pad_token_id,
+            tokenizer.eos_token_id,
+            tokenizer.bos_token_id,
+            tokenizer.unk_token_id,
+        ]:
+            if special_id is not None:
+                unused_tokens.append(special_id)
+        special_ids = getattr(tokenizer, "all_special_ids", []) or []
+        unused_tokens.extend(special_ids)
+        # Remove tokens that contain special or punctuation-heavy characters.
         for num in range(len(tokenizer)):
             text = tokenizer.decode(num)
-            for symbol in ["\n", '"', "#", "..."]:
+            for symbol in ["\n", '"', "#", "...", "~", "`"]:
                 if symbol in text:
                     unused_tokens.append(num)
         if args.drop_non_english_tokens:
@@ -257,14 +305,13 @@ def generation(
         
         if args.drop_change_line_characters:
             print("Dropping change line characters")
-            unused_tokens = []
             pattern = r"^[a-z]+(?:[\'-][a-z]+)*$"
 
             for token in range(tokenizer.vocab_size):
                 text = tokenizer.decode(token)
                 # Check for special characters or length constraint
                 if (
-                    any(char in text for char in "*;:_\n-'<>:{}[]()/\\|=+%@~`^#$&")
+                    any(char in text for char in "*;:_\n-'<>:{}[]()/\\|=+%@~`^#$&!?.,")
                     or len(text) > 17
                 ):
                     unused_tokens.append(token)
@@ -351,6 +398,7 @@ def generation(
         )
         args.first_prompt_end_index = args.gen_max_tokens
 
+    assert_finite_tensor("x_embeds_init", x_embeds)
     lm_embeddings_weight = lm_embeddings.weight.unsqueeze(0)
 
     dm_projectors = None
@@ -413,22 +461,7 @@ def generation(
         args.n_steps = 0
 
     for it in range(args.n_steps):
-        if isinstance(prompt_embeddings, list):
-        # First prompt
-            x_embeds.data[
-                :,
-                args.first_prompt_end_index
-                - prompt_len[0] : args.first_prompt_end_index,
-                :,
-            ] = (
-                prompt_embeddings[0].detach().clone()
-            )
-            # Second prompt
-            x_embeds.data[:, -prompt_len[1] :, :] = (
-                prompt_embeddings[1].detach().clone()
-            )
-        else:
-            x_embeds.data[:, -prompt_len:, :] = prompt_embeddings.detach().clone()
+        _copy_prompt_embeddings(x_embeds, prompt_embeddings, prompt_len, args.first_prompt_end_index)
         if (
             args.use_dm
             and args.dm_resample_every > 0
@@ -441,10 +474,9 @@ def generation(
         dm_loss_value = 0.0
         if args.opt_alg == "admm":
             # x + rho^-1 * lambda
-            intermediate_embeds = x_embeds.data.clone().detach()
-            intermediate_embeds.add_(
-                (1 / args.admm_rho) * lambda_embeds.data.clone().detach()
-            )
+            intermediate_embeds = x_embeds.detach().clone()
+            intermediate_embeds.add_((1 / args.admm_rho) * lambda_embeds.detach())
+            assert_finite_tensor("admm_intermediate_embeds", intermediate_embeds, step=it)
             if args.conversion_method == "topk":
                 _, z_ids = get_topk_closest_tokens(
                     intermediate_embeds,
@@ -490,7 +522,10 @@ def generation(
                 # print("z_ids.shape", z_ids.shape)
                 # print("prompt_ids.shape", prompt_ids.shape)
                 z_ids[:, -prompt_len:] = prompt_ids  # shape: (gen_tokens,)
-            z_embeds.data[:] = lm_embeddings(z_ids.unsqueeze(0)).detach().clone()
+            with torch.no_grad():
+                z_embeds.copy_(lm_embeddings(z_ids.unsqueeze(0)).detach())
+            assert_finite_tensor("z_ids", z_ids, step=it)
+            assert_finite_tensor("z_embeds", z_embeds, step=it)
 
             def closure():
                 nonlocal dm_loss_value
@@ -560,6 +595,10 @@ def generation(
                     )
                     if args.use_dm:
                         tot_loss = tot_loss + args.dm_weight * dm_loss
+                assert_finite_scalar("tot_loss", tot_loss, step=it)
+                assert_finite_scalar("rec_loss", rec_loss, step=it)
+                assert_finite_scalar("reg_loss", reg_loss, step=it)
+                assert_finite_scalar("dm_loss", dm_loss, step=it)
                 tot_loss.backward()
                 # print(f"----Inner ADMM step: total loss {tot_loss.item()}, rec_loss {rec_loss.item()}, admm_item {(args.admm_rho / 2) * reg_loss.item()}, embed_diff {args.coeff_reg * embed_diff}, perp loss {args.coeff_perplexity * perp_loss}")
                 if args.dataset in ["rotten_tomatoes", "imdb", "rtpolarity"]:
@@ -577,6 +616,8 @@ def generation(
                 error, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss, dm_loss = opt.step(
                     closure
                 )
+                assert_finite_tensor("x_embeds_after_opt_step", x_embeds, step=it)
+                _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
             
             # update lambda embeddings
             if args.conversion_method == "topk":
@@ -623,6 +664,7 @@ def generation(
             else:
                 proj_ids[:, -prompt_len:] = prompt_ids  # shape: (gen_tokens,)
             
+            assert_finite_tensor("x_embeds_before_get_loss", x_embeds, step=it)
             loss_dict = get_loss(
                 args,
                 model,
@@ -647,10 +689,11 @@ def generation(
                 f" rec_loss_ids = {loss_dict['rec_loss_ids'].item()}"
                 f" perplexity = {loss_dict['perplexity'].item()}"
             )
-            lambda_embeds.add_(
-                args.admm_rho
-                * (x_embeds.data.detach().clone() - z_embeds.data.detach().clone())
-            )
+            with torch.no_grad():
+                lambda_embeds.add_(args.admm_rho * (x_embeds.detach() - z_embeds.detach()))
+            assert_finite_tensor("lambda_embeds_after_update", lambda_embeds, step=it)
+            _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
+            assert_finite_tensor("lambda_embeds", lambda_embeds, step=it)
         else:
             def closure():
                 nonlocal dm_loss_value
@@ -725,9 +768,7 @@ def generation(
                     mapped_true_embeds = lm_embeddings(proj_ids)
                     # perplexity loss
                     perp_loss = get_perplexity_loss(x_embeds, proj_ids, model)
-                    cos_sim_reg = 1 - (x_embeds * mapped_true_embeds).sum() / (
-                        x_embeds.norm(p=2) * mapped_true_embeds.norm(p=2)
-                    )
+                    cos_sim_reg = 1 - cos_sim(x_embeds, mapped_true_embeds)
                     embed_diff = cos_sim_reg + args.coeff_perplexity * perp_loss
                     # print(
                     #     f"embed_diff: {embed_diff.item()}, perp_loss: {perp_loss.item()},"
@@ -768,6 +809,10 @@ def generation(
                     tot_loss = rec_loss + args.coeff_reg * reg_loss
                     if args.use_dm:
                         tot_loss = tot_loss + args.dm_weight * dm_loss
+                assert_finite_scalar("tot_loss", tot_loss, step=it)
+                assert_finite_scalar("rec_loss", rec_loss, step=it)
+                assert_finite_scalar("reg_loss", reg_loss, step=it)
+                assert_finite_scalar("dm_loss", dm_loss, step=it)
                 tot_loss.backward(retain_graph=True)
                 with torch.no_grad():
                     if args.grad_clip is not None:
@@ -777,30 +822,20 @@ def generation(
                 return tot_loss, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss
 
             error, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss = opt.step(closure)
+            assert_finite_tensor("x_embeds_after_opt_step", x_embeds, step=it)
+            _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
 
-        if isinstance(prompt_embeddings, list):
-            # First prompt
-            x_embeds.data[
-                :,
-                args.first_prompt_end_index
-                - prompt_len[0] : args.first_prompt_end_index,
-                :,
-            ] = (
-                prompt_embeddings[0].detach().clone()
-            )
-            # Second prompt
-            x_embeds.data[:, -prompt_len[1] :, :] = (
-                prompt_embeddings[1].detach().clone()
-            )
-        else:
-            x_embeds.data[:, -prompt_len:, :] = prompt_embeddings.detach().clone()
+        _copy_prompt_embeddings(x_embeds, prompt_embeddings, prompt_len, args.first_prompt_end_index)
+        assert_finite_tensor("x_embeds_after_prompt_copy", x_embeds, step=it)
         if best_final_error is None or error <= best_final_error:
             best_final_error = error.item()
             best_norm_diff = norm_diff.item() if norm_diff is not None else 0.0
             best_embed_diff = embed_diff.item() if embed_diff is not None else 0.0
             best_rec_loss = rec_loss.item()
             best_reg_loss = reg_loss.item()
-            best_final_x.data[:] = x_embeds.data[:]
+            assert_finite_tensor("best_candidate_x", x_embeds, step=it)
+            with torch.no_grad():
+                best_final_x.copy_(x_embeds.detach())
         del error, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss
 
         lr_scheduler.step()
@@ -867,19 +902,20 @@ def generation(
                     _, cos_ids = get_closest_tokens(
                         x_embeds, unused_tokens, lm_embeddings_weight
                     )
-                    loss_dict = get_loss(
-                        args,
-                        model,
-                        cos_ids,
-                        x_embeds,
-                        torch.ones(
-                            cos_ids.shape[0], cos_ids.shape[1], device=device
-                        ).long(),  # shape: (bs, gen_tokens)
-                        true_labels_tokenized,
-                        true_grads,
-                        avg_embeds,
-                        previous_grad=previous_grad,
-                    )
+                assert_finite_tensor("x_embeds_before_print_get_loss", x_embeds, step=it)
+                loss_dict = get_loss(
+                    args,
+                    model,
+                    cos_ids,
+                    x_embeds,
+                    torch.ones(
+                        cos_ids.shape[0], cos_ids.shape[1], device=device
+                    ).long(),  # shape: (bs, gen_tokens)
+                    true_labels_tokenized,
+                    true_grads,
+                    avg_embeds,
+                    previous_grad=previous_grad,
+                )
                 perplexity = loss_dict["perplexity"]
                 rec_loss_embeds = loss_dict["rec_loss_embeds"]
                 rec_loss_ids = loss_dict["rec_loss_ids"]
@@ -917,13 +953,14 @@ def generation(
             else:
                 print(
                     "[%4d/%4d] best_final_error=%.3f, best_norm_diff=%.3f,"
-                    " best_embed_diff=%.3f [t=%.2fs]"
+                    " best_embed_diff=%.3f, dm_loss=%.3f [t=%.2fs]"
                     % (
                         steps_done,
                         args.n_steps,
                         best_final_error,
                         best_norm_diff,
                         best_embed_diff,
+                        dm_loss_value,
                         step_time,
                     ),
                     flush=True,
@@ -932,7 +969,9 @@ def generation(
     # Postprocess
     if only_init:
         args.n_steps = prev_n_steps
-    x_embeds.data = best_final_x
+    assert_finite_tensor("best_final_x", best_final_x)
+    with torch.no_grad():
+        x_embeds.copy_(best_final_x.detach())
 
     avg_new_grad = None
     list_return_dict = []
@@ -1014,6 +1053,7 @@ def generation(
                     first_prompt_end_index=args.first_prompt_end_index,
                 )
             ]
+        assert_finite_tensor("x_embeds_before_get_loss", x_embeds)
         loss_dict = get_loss(
             args,
             model,
@@ -1356,7 +1396,6 @@ def compute_average_grads(args, model, tokenizer, sequences, labels):
 
 
 def main():
-    summary_metrics = {}
     args = get_args()
     args.work_dir = os.path.join(args.work_base_dir, get_args_flags(args))
     if os.path.exists(args.work_dir):
@@ -1364,22 +1403,14 @@ def main():
         if args.overwrite:
             print("Overwriting work directory...")
             shutil.rmtree(args.work_dir)
+            set_all_seeds(args.rng_seed)
+            summary_metrics, pos_generations, neg_generations = init_empty_run_state(args)
         else:
             print("Restoring RNG state ... ")
             if not os.path.exists(os.path.join(args.work_dir, "rng_states.pth")):
                 print("RNG state file not found. Starting from scratch.")
                 set_all_seeds(args.rng_seed)
-                # key metrics
-                summary_metrics["mean_perplexity"] = None
-                summary_metrics["mean_rec_loss"] = None
-                summary_metrics["mean_tot_loss"] = None
-                summary_metrics["perplexity"] = []
-                summary_metrics["rec_loss_embeds"] = []
-                summary_metrics["rec_loss_ids"] = []
-                summary_metrics["tot_loss"] = []
-                summary_metrics["embed_diff_ids"] = []
-                pos_generations = []
-                neg_generations = []
+                summary_metrics, pos_generations, neg_generations = init_empty_run_state(args)
             else:
                 load_rng_states(args.work_dir)
                 # determine remaining n_gen
@@ -1404,17 +1435,7 @@ def main():
     else:
         print("Creating work directory: ", args.work_dir)
         set_all_seeds(args.rng_seed)
-        # key metrics
-        summary_metrics["mean_perplexity"] = None
-        summary_metrics["mean_rec_loss"] = None
-        summary_metrics["mean_tot_loss"] = None
-        summary_metrics["perplexity"] = []
-        summary_metrics["rec_loss_embeds"] = []
-        summary_metrics["rec_loss_ids"] = []
-        summary_metrics["tot_loss"] = []
-        summary_metrics["embed_diff_ids"] = []
-        pos_generations = []
-        neg_generations = []
+        summary_metrics, pos_generations, neg_generations = init_empty_run_state(args)
     
     os.makedirs(args.work_dir, exist_ok=True)
     summary_metrics["args"] = vars(args)
@@ -1440,11 +1461,10 @@ def main():
     config = AutoConfig.from_pretrained(model_id)
     config.pad_token_id = pad_token_id
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        config=config,
-        device_map="auto",
-    )
+    model_kwargs = {"config": config, "device_map": "auto"}
+    if args.force_float32_model:
+        model_kwargs["torch_dtype"] = torch.float32
+    model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
     # Set gradient for only last layers
     if args.last_layer_gradient:
         named_parameters_to_optim = []

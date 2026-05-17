@@ -1,6 +1,7 @@
 import os
 import re
 import random
+import math
 
 import numpy as np
 import torch
@@ -79,6 +80,8 @@ def get_args_flags(args):
             flags += "_byclass"
     flags += f"-rho{args.admm_rho}"
     flags += f"-inner{args.admm_inner_steps}"
+    if getattr(args, "embed_value_clip", None) is not None:
+        flags += f"-clip{args.embed_value_clip}"
     flags += f"-seed{args.rng_seed}"
     
     return flags
@@ -196,28 +199,41 @@ def compute_grads_lm_ids(
     return grad
 
 
-def cos_sim(x, y):
-    return (x * y).sum() / (x.norm(p=2) * y.norm(p=2))
+def assert_finite_tensor(name, tensor, step=None):
+    """Raise a diagnostic error if a tensor contains NaN or Inf values."""
+    if tensor is not None and torch.is_tensor(tensor) and not torch.isfinite(tensor).all():
+        raise FloatingPointError(
+            f"Non-finite tensor: {name}, step={step}, shape={tuple(tensor.shape)}"
+        )
 
 
-def cos_sim_batch(x, y):
-    """Compute batch-wise cosine similarity between two batches of vectors.
+def assert_finite_scalar(name, value, step=None):
+    """Raise a diagnostic error if a scalar tensor or Python scalar is NaN/Inf."""
+    if value is None:
+        return
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            assert_finite_tensor(name, value, step=step)
+        elif not torch.isfinite(value.detach()).all():
+            raise FloatingPointError(f"Non-finite scalar: {name}, step={step}, value={value}")
+        return
+    if not math.isfinite(float(value)):
+        raise FloatingPointError(f"Non-finite scalar: {name}, step={step}, value={value}")
 
-    Args:
-        x: Tensor of shape (batch_size, vector_dim)
-        y: Tensor of shape (batch_size, vector_dim)
 
-    Returns:
-        Tensor of shape (batch_size,) containing cosine similarity for each pair.
-    """
-    # Ensure x and y are normalized to prevent division by zero
-    x_norm = x / x.norm(p=2, dim=1, keepdim=True)
-    y_norm = y / y.norm(p=2, dim=1, keepdim=True)
+def cos_sim(x, y, eps=1e-8):
+    x = x.float()
+    y = y.float()
+    denom = (x.norm(p=2) * y.norm(p=2)).clamp_min(eps)
+    return (x * y).sum() / denom
 
-    # Compute cosine similarity for each vector in the batch
-    cos_similarities = (x_norm * y_norm).sum(dim=1)
 
-    return cos_similarities.mean()
+def cos_sim_batch(x, y, eps=1e-8):
+    """Compute numerically safe mean batch-wise cosine similarity."""
+    x = x.float()
+    y = y.float()
+    denom = (x.norm(p=2, dim=1, keepdim=True) * y.norm(p=2, dim=1, keepdim=True)).clamp_min(eps)
+    return ((x * y).sum(dim=1, keepdim=True) / denom).mean()
 
 
 def grad_dist(target_grads, curr_grads, args, previous_grad=None):
@@ -232,30 +248,48 @@ def grad_dist(target_grads, curr_grads, args, previous_grad=None):
     Returns:
         ret: objective
     """
-    ret = 0.0
+    target_grads = list(target_grads)
+    curr_grads = list(curr_grads)
+    ret = None
     n_g = 0
     if previous_grad is None:
         previous_grad = [None for _ in range(len(curr_grads))]
-    for g1, g2, g3 in zip(target_grads, curr_grads, previous_grad):
-        if (g1 is not None) and (g2 is not None):
-            if g3 is None:
-                g3 = torch.zeros_like(g2)
-            else:
-                g3 = g3.to(g2.device)  # pytype: disable=attribute-error
+    previous_grad = list(previous_grad)
+    for idx, (g1, g2, g3) in enumerate(zip(target_grads, curr_grads, previous_grad)):
+        if g1 is None or g2 is None:
+            continue
+        if not torch.isfinite(g1).all():
+            raise FloatingPointError(f"Non-finite target gradient at index {idx}")
+        if not torch.isfinite(g2).all():
+            raise FloatingPointError(f"Non-finite current gradient at index {idx}")
+        if g3 is None:
+            g3 = torch.zeros_like(g2)
+        else:
+            if not torch.isfinite(g3).all():
+                raise FloatingPointError(f"Non-finite previous gradient at index {idx}")
+            g3 = g3.to(g2.device)  # pytype: disable=attribute-error
+        g1 = g1.to(device=g2.device, dtype=torch.float32)
+        g2 = g2.float()
+        g3 = g3.float()
+        if ret is None:
+            ret = g2.new_zeros(())
         if args.loss == "cos":
-            ret += 1 - cos_sim(g1, g2 + g3)
+            ret = ret + 1 - cos_sim(g1, g2 + g3)
         elif args.loss == "dlg":
-            ret += (g1 - g2 - g3).square().sum()
+            ret = ret + (g1 - g2 - g3).square().sum()
         elif args.loss == "tag":
-            ret += (g1 - g2 - g3).square().sum() + args.tag_factor * torch.abs(
+            ret = ret + (g1 - g2 - g3).square().sum() + args.tag_factor * torch.abs(
                 g1 - g2 - g3
             ).sum()
         else:
             assert False
         n_g += 1
+    if ret is None:
+        device = next((g.device for g in target_grads + curr_grads if g is not None), torch.device("cpu"))
+        return torch.zeros((), device=device)
     if args.loss == "cos":
-        ret /= n_g
-    
+        ret = ret / max(n_g, 1)
+    assert_finite_tensor("grad_dist", ret)
     return ret
 
 
@@ -274,14 +308,17 @@ def get_closest_tokens(
         d: Distance matrix
         cos_ids: Closest token ids, shape (seq_len)
     """
+    assert_finite_tensor("inputs_embeds", inputs_embeds)
     embeddings_weight = embeddings_weight.repeat(inputs_embeds.shape[0], 1, 1)
     if metric == "l2":
         d = torch.cdist(inputs_embeds, embeddings_weight, p=2)
     elif metric == "cos":
-        dp = torch.bmm(inputs_embeds, embeddings_weight.transpose(1, 2))
-        norm1 = inputs_embeds.norm(p=2, dim=2).unsqueeze(2)
-        norm2 = embeddings_weight.norm(p=2, dim=2).unsqueeze(1)
-        d = -dp / (norm1 * norm2)
+        x = inputs_embeds.float()
+        w = embeddings_weight.float()
+        dp = torch.bmm(x, w.transpose(1, 2))
+        norm1 = x.norm(p=2, dim=2).unsqueeze(2)
+        norm2 = w.norm(p=2, dim=2).unsqueeze(1)
+        d = -dp / (norm1 * norm2).clamp_min(1e-8)
     else:
         assert False
     d[:, :, unused_tokens] = 1e9
@@ -415,11 +452,14 @@ def get_topk_closest_tokens(
         d: Distance matrix
         cos_ids: Closest token ids, shape (seq_len)
     """
+    assert_finite_tensor("inputs_embeds", inputs_embeds)
     embeddings_weight = embeddings_weight.repeat(inputs_embeds.shape[0], 1, 1)
-    dp = torch.bmm(inputs_embeds, embeddings_weight.transpose(1, 2))
-    norm1 = inputs_embeds.norm(p=2, dim=2).unsqueeze(2)
-    norm2 = embeddings_weight.norm(p=2, dim=2).unsqueeze(1)
-    d = -dp / (norm1 * norm2)
+    x = inputs_embeds.float()
+    w = embeddings_weight.float()
+    dp = torch.bmm(x, w.transpose(1, 2))
+    norm1 = x.norm(p=2, dim=2).unsqueeze(2)
+    norm2 = w.norm(p=2, dim=2).unsqueeze(1)
+    d = -dp / (norm1 * norm2).clamp_min(1e-8)
     d[:, :, unused_tokens] = 1e9
     d = torch.argsort(d, dim=2)
     gen_max_tokens = inputs_embeds.shape[1]
@@ -542,10 +582,14 @@ def sample_sequence(
     top_k=0,
     top_p=0.0,
 ):
-    dp = torch.bmm(inputs_embeds, embeddings_weight.transpose(1, 2))
-    norm1 = inputs_embeds.norm(p=2, dim=2).unsqueeze(2)
-    norm2 = embeddings_weight.norm(p=2, dim=2).unsqueeze(1)
-    d = -dp / (norm1 * norm2)
+    assert_finite_tensor("inputs_embeds", inputs_embeds)
+    embeddings_weight = embeddings_weight.repeat(inputs_embeds.shape[0], 1, 1)
+    x = inputs_embeds.float()
+    w = embeddings_weight.float()
+    dp = torch.bmm(x, w.transpose(1, 2))
+    norm1 = x.norm(p=2, dim=2).unsqueeze(2)
+    norm2 = w.norm(p=2, dim=2).unsqueeze(1)
+    d = -dp / (norm1 * norm2).clamp_min(1e-8)
     d[:, :, unused_tokens] = -1e9
     prob_d = F.softmax(d, dim=-1)
     gen_max_tokens = inputs_embeds.shape[1]

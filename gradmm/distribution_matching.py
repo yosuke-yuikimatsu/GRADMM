@@ -20,6 +20,13 @@ def _compatible_heads(hidden_dim, requested_heads=4):
     return 1
 
 
+
+def _assert_finite(name, tensor):
+    if tensor is not None and torch.is_tensor(tensor) and not torch.isfinite(tensor).all():
+        raise FloatingPointError(
+            f"Non-finite tensor in distribution matching: {name}, shape={tuple(tensor.shape)}"
+        )
+
 def masked_pool(features, attention_mask, mode="mean"):
     """Pool token features with an attention mask.
 
@@ -229,6 +236,9 @@ def compute_dm_loss(
     if projectors is None or len(projectors) == 0:
         return syn_embeds.new_zeros(())
 
+    _assert_finite("real_embeds", real_embeds)
+    _assert_finite("syn_embeds", syn_embeds)
+
     real_labels = real_labels.to(device=syn_embeds.device).view(-1)
     syn_labels = syn_labels.to(device=syn_embeds.device).view(-1)
     losses = []
@@ -241,6 +251,8 @@ def compute_dm_loss(
         )
         real_features = projector(projector_real_embeds, projector_real_attention_mask)
         syn_features = projector(projector_syn_embeds, projector_syn_attention_mask)
+        _assert_finite("real_features", real_features)
+        _assert_finite("syn_features", syn_features)
         projector_real_labels = real_labels.to(device=real_features.device)
         projector_syn_labels = syn_labels.to(device=syn_features.device)
         if args.dm_detach_real_features:
@@ -263,4 +275,6 @@ def compute_dm_loss(
 
     if not losses:
         return syn_embeds.new_zeros(())
-    return torch.stack(losses).mean()
+    dm_loss = torch.stack(losses).mean()
+    _assert_finite("dm_loss", dm_loss)
+    return dm_loss

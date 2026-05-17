@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from distribution_matching import RandomMLPProjector, build_dm_projectors, compute_dm_loss
-from utilities import align_embeds_to_model, compute_grads_lm
+from utilities import align_embeds_to_model, compute_grads_lm, cos_sim, cos_sim_batch, grad_dist
 
 
 def _args(**overrides):
@@ -77,6 +77,30 @@ def test_compute_grads_lm_norm_clip_supports_higher_order_backward():
 def test_compute_grads_lm_elem_clip_supports_higher_order_backward():
     _assert_higher_order_grad_clip_backward("elem")
 
+
+
+def test_cos_sim_zero_vectors_is_finite():
+    value = cos_sim(torch.zeros(4), torch.zeros(4))
+    assert torch.isfinite(value)
+
+
+def test_cos_sim_batch_zero_rows_is_finite():
+    value = cos_sim_batch(torch.zeros(3, 4), torch.zeros(3, 4))
+    assert torch.isfinite(value)
+
+
+def test_grad_dist_zero_cosine_gradients_is_finite():
+    args = SimpleNamespace(loss="cos")
+    value = grad_dist([torch.zeros(2, 3)], [torch.zeros(2, 3)], args)
+    assert torch.isfinite(value)
+
+
+def test_grad_dist_all_none_returns_finite_zero_scalar():
+    args = SimpleNamespace(loss="cos")
+    value = grad_dist([None, None], [None, None], args)
+    assert value.ndim == 0
+    assert torch.isfinite(value)
+    assert value.item() == 0.0
 
 def test_random_mlp_projector_shape():
     projector = RandomMLPProjector(input_dim=5, feature_dim=7)
@@ -170,6 +194,10 @@ def test_dm_loss_logging_value_is_always_defined_in_closure_path():
 
 
 if __name__ == "__main__":
+    test_cos_sim_zero_vectors_is_finite()
+    test_cos_sim_batch_zero_rows_is_finite()
+    test_grad_dist_zero_cosine_gradients_is_finite()
+    test_grad_dist_all_none_returns_finite_zero_scalar()
     test_random_mlp_projector_shape()
     test_dm_loss_backward_frozen_params_and_class_aware_labels()
     test_dtype_alignment_preserves_gradient_flow()
