@@ -108,6 +108,24 @@ def align_attention_mask_to_embeds(attention_mask, inputs_embeds):
         return None
     return attention_mask.to(device=inputs_embeds.device)
 
+
+def _clip_grads_out_of_place(grads, gen_grad_clip):
+    if gen_grad_clip == "elem":
+        return [g.clamp(min=-1, max=1) if g is not None else None for g in grads]
+    if gen_grad_clip == "norm":
+        valid = [g for g in grads if g is not None]
+        if valid:
+            norm = torch.sqrt(sum((g.float().square()).sum() for g in valid)).to(
+                valid[0].device
+            )
+            scale = torch.clamp(1.0 / (norm + 1e-6), max=1.0)
+            return [
+                g * scale.to(device=g.device, dtype=g.dtype) if g is not None else None
+                for g in grads
+            ]
+    return grads
+
+
 def compute_grads_lm(
     model,
     x_embeds,
@@ -141,13 +159,8 @@ def compute_grads_lm(
         create_graph=create_graph,
         allow_unused=True,
     )
-    if gen_grad_clip == "elem":
-        grads = [g.clamp_(min=-1, max=1) if g is not None else None for g in grads]
-    elif gen_grad_clip == "norm":
-        norm = torch.sqrt(sum((g**2).sum() for g in grads if g is not None))
-        if norm > 1:
-            grads = [g.div_(norm) if g is not None else None for g in grads]
-    
+    grads = _clip_grads_out_of_place(grads, gen_grad_clip)
+
     return grads
 
 
@@ -178,13 +191,8 @@ def compute_grads_lm_ids(
         create_graph=create_graph,
         allow_unused=True,
     )
-    if gen_grad_clip == "elem":
-        grad = [g.clamp_(min=-1, max=1) if g is not None else None for g in grad]
-    elif gen_grad_clip == "norm":
-        norm = torch.sqrt(sum((g**2).sum() for g in grad if g is not None))
-        if norm > 1:
-            grad = [g.div_(norm) if g is not None else None for g in grad]
-    
+    grad = _clip_grads_out_of_place(grad, gen_grad_clip)
+
     return grad
 
 

@@ -6,7 +6,7 @@ import torch
 from torch import nn
 
 from distribution_matching import RandomMLPProjector, build_dm_projectors, compute_dm_loss
-from utilities import align_embeds_to_model
+from utilities import align_embeds_to_model, compute_grads_lm
 
 
 def _args(**overrides):
@@ -30,6 +30,52 @@ class _TinyModel(nn.Module):
 
     def get_input_embeddings(self):
         return self.embeddings
+
+
+class _TinyCausalLM(nn.Module):
+    def __init__(self, vocab_size=11, embed_dim=6):
+        super().__init__()
+        self.embeddings = nn.Embedding(vocab_size, embed_dim)
+        self.lm_head = nn.Linear(embed_dim, vocab_size)
+
+    def get_input_embeddings(self):
+        return self.embeddings
+
+    def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None):
+        del attention_mask
+        if inputs_embeds is None:
+            inputs_embeds = self.embeddings(input_ids)
+        return SimpleNamespace(logits=self.lm_head(inputs_embeds))
+
+
+def _assert_higher_order_grad_clip_backward(gen_grad_clip):
+    torch.manual_seed(0)
+    model = _TinyCausalLM()
+    x_embeds = torch.randn(2, 3, 6, requires_grad=True) * 25
+    attention_mask = torch.ones(2, 3, dtype=torch.long)
+    y_labels = torch.tensor([1])
+
+    grads = compute_grads_lm(
+        model,
+        x_embeds,
+        attention_mask,
+        y_labels,
+        create_graph=True,
+        gen_grad_clip=gen_grad_clip,
+    )
+    grad_loss = sum(g.float().square().sum() for g in grads if g is not None)
+
+    grad_loss.backward()
+
+    assert any(param.grad is not None for param in model.parameters())
+
+
+def test_compute_grads_lm_norm_clip_supports_higher_order_backward():
+    _assert_higher_order_grad_clip_backward("norm")
+
+
+def test_compute_grads_lm_elem_clip_supports_higher_order_backward():
+    _assert_higher_order_grad_clip_backward("elem")
 
 
 def test_random_mlp_projector_shape():
@@ -128,4 +174,6 @@ if __name__ == "__main__":
     test_dm_loss_backward_frozen_params_and_class_aware_labels()
     test_dtype_alignment_preserves_gradient_flow()
     test_dm_loss_logging_value_is_always_defined_in_closure_path()
+    test_compute_grads_lm_norm_clip_supports_higher_order_backward()
+    test_compute_grads_lm_elem_clip_supports_higher_order_backward()
     print("DM smoke checks passed.")
