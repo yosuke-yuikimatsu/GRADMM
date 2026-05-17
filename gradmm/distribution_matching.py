@@ -129,6 +129,25 @@ class RandomBertProjector(nn.Module):
         return masked_pool(token_features, attention_mask, mode=self.pooling)
 
 
+
+
+def _projector_dtype_device(projector):
+    try:
+        param = next(projector.parameters())
+        return param.dtype, param.device
+    except StopIteration:
+        return torch.float32, torch.device("cpu")
+
+
+def _align_to_projector(inputs_embeds, attention_mask, projector):
+    """Move/cast embeddings for a frozen projector without detaching gradients."""
+    dtype, device = _projector_dtype_device(projector)
+    inputs_embeds = inputs_embeds.to(device=device, dtype=dtype)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device=device)
+    return inputs_embeds, attention_mask
+
+
 def build_dm_projectors(args, lm_embed_dim, device):
     """Build frozen random DM projectors while preserving input gradients."""
     projectors = []
@@ -214,17 +233,25 @@ def compute_dm_loss(
     syn_labels = syn_labels.to(device=syn_embeds.device).view(-1)
     losses = []
     for projector in projectors:
-        real_features = projector(real_embeds, real_attention_mask)
-        syn_features = projector(syn_embeds, syn_attention_mask)
+        projector_real_embeds, projector_real_attention_mask = _align_to_projector(
+            real_embeds, real_attention_mask, projector
+        )
+        projector_syn_embeds, projector_syn_attention_mask = _align_to_projector(
+            syn_embeds, syn_attention_mask, projector
+        )
+        real_features = projector(projector_real_embeds, projector_real_attention_mask)
+        syn_features = projector(projector_syn_embeds, projector_syn_attention_mask)
+        projector_real_labels = real_labels.to(device=real_features.device)
+        projector_syn_labels = syn_labels.to(device=syn_features.device)
         if args.dm_detach_real_features:
             real_features = real_features.detach()
 
         if args.dm_by_class:
             class_losses = []
-            common_labels = torch.unique(syn_labels)
+            common_labels = torch.unique(projector_syn_labels)
             for label in common_labels:
-                real_idx = real_labels == label
-                syn_idx = syn_labels == label
+                real_idx = projector_real_labels == label
+                syn_idx = projector_syn_labels == label
                 if real_idx.any() and syn_idx.any():
                     class_losses.append(
                         _discrepancy(args, real_features[real_idx], syn_features[syn_idx])

@@ -1,9 +1,11 @@
 import torch
 
 from utilities import (
+    align_embeds_to_model,
     get_closest_tokens,
     get_reconstruction_loss,
-    get_reconstruction_loss_ids
+    get_reconstruction_loss_ids,
+    get_model_dtype_device,
 )
 
 
@@ -38,7 +40,7 @@ def get_init_lm(
     Returns:
         x_embeds: Initial embeddings
     """
-    device = model.device
+    _, device = get_model_dtype_device(model)
     num_inits = shape[0]
     if isinstance(prompt_embeddings, list):
         prompt_len = [prompt.shape[0] for prompt in prompt_embeddings]
@@ -49,9 +51,10 @@ def get_init_lm(
 
     # Generate candidates from random
     new_shape = [args.init_candidates * num_inits] + list(shape[1:])
-    embeds = torch.randn(new_shape).to(device)
+    model_dtype, device = get_model_dtype_device(model)
+    embeds = torch.randn(new_shape, device=device, dtype=model_dtype)
     if args.init == 'random_normal':
-        embeds = torch.randn(new_shape).to(device)
+        embeds = torch.randn(new_shape, device=device, dtype=model_dtype)
     elif args.init == 'random_embed':
         # Randomly sample word indices
         random_indices = torch.randint(
@@ -112,7 +115,7 @@ def get_init_lm(
         best_x_embeds /= torch.norm(best_x_embeds, dim=2, keepdim=True)
         best_x_embeds *= args.init_size
 
-    x_embeds = best_x_embeds.detach().clone()
+    x_embeds = align_embeds_to_model(best_x_embeds, model).detach().clone()
     x_embeds.requires_grad_(True)
 
     return x_embeds

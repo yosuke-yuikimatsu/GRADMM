@@ -84,6 +84,30 @@ def get_args_flags(args):
     return flags
 
 
+
+
+def get_model_dtype_device(model):
+    """Return the dtype/device expected by the model input embedding path."""
+    try:
+        weight = model.get_input_embeddings().weight
+        return weight.dtype, weight.device
+    except Exception:
+        param = next(model.parameters())
+        return param.dtype, param.device
+
+
+def align_embeds_to_model(inputs_embeds, model):
+    """Cast embeddings to the model input dtype/device without detaching gradients."""
+    dtype, device = get_model_dtype_device(model)
+    return inputs_embeds.to(device=device, dtype=dtype)
+
+
+def align_attention_mask_to_embeds(attention_mask, inputs_embeds):
+    """Move an attention mask alongside embeddings for inputs_embeds forwards."""
+    if attention_mask is None:
+        return None
+    return attention_mask.to(device=inputs_embeds.device)
+
 def compute_grads_lm(
     model,
     x_embeds,
@@ -93,8 +117,11 @@ def compute_grads_lm(
     gen_grad_clip="",
 ):
     criterion = nn.CrossEntropyLoss()
+    x_embeds = align_embeds_to_model(x_embeds, model)
+    attention_mask = align_attention_mask_to_embeds(attention_mask, x_embeds)
     outputs = model(inputs_embeds=x_embeds, attention_mask=attention_mask)
     logits = outputs.logits[:, -1, :]
+    y_labels = y_labels.to(device=logits.device)
 
     # Short text labels, such as "Yes" or "No", can sometimes span more than one
     # token. For classification purposes, we can use only the first token. In
@@ -135,6 +162,7 @@ def compute_grads_lm_ids(
     criterion = nn.CrossEntropyLoss()
     outputs = model(input_ids=ids, attention_mask=attention_mask)
     logits = outputs.logits[:, -1, :]
+    y_labels = y_labels.to(device=logits.device)
     # Short text labels, such as "Yes" or "No", can sometimes span more than one
     # token. For classification purposes, we can use only the first token. In
     # MeZO, this is addressed by introducing the "option length" field. For now,
@@ -563,8 +591,10 @@ def sample_sequence(
 
 
 def get_perplexity_loss(x_embeds, label_ids, model):
+    x_embeds = align_embeds_to_model(x_embeds, model)
     output = model(inputs_embeds=x_embeds)
     logits = output.logits
+    label_ids = label_ids.to(device=logits.device)
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = label_ids[..., 1:].contiguous()
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)

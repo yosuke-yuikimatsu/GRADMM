@@ -64,6 +64,42 @@ python generate.py \
   --dm_weight 0.1
 ```
 
+### Colab/Kaggle DM Smoke Test
+
+The following small SST-2 validation run disables WandB login, exercises `--model_name phi`, and should log `dm_loss` while saving outputs under `synthetic_data/smoke_dm_mlp/...`:
+
+```bash
+WANDB_MODE=disabled WANDB_DISABLED=true CUDA_VISIBLE_DEVICES=0 python generate.py \
+  --rng_seed 42 \
+  --dataset sst2 \
+  --split validation \
+  --batch_size 4 \
+  --n_steps 2 \
+  --n_gen_samples 4 \
+  --subset_size 4 \
+  --n_gen 2 \
+  --gen_bs 2 \
+  --use_auto_gen_tokens true \
+  --print_full true \
+  --print_every 1 \
+  --save_every 1 \
+  --model_name phi \
+  --opt_alg admm \
+  --admm_rho 0.5 \
+  --admm_inner_steps 2 \
+  --work_base_dir ./synthetic_data/smoke_dm_mlp \
+  --grad_clip 1.0 \
+  --topk 50 \
+  --use_dm true \
+  --dm_mode regularizer \
+  --dm_weight 1.0 \
+  --dm_projector mlp \
+  --dm_match mean \
+  --dm_num_projectors 1 \
+  --dm_by_class true \
+  --dm_real_batch_size 4
+```
+
 ## Finetuning
 1. Obtain the synthetic data paths by running the `Print fine-tuning paths` section in the notebook `gradmm/Finetuning.ipynb`.
 
