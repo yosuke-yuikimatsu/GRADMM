@@ -5,8 +5,18 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from distribution_matching import RandomMLPProjector, build_dm_projectors, compute_dm_loss
-from utilities import align_embeds_to_model, compute_grads_lm, cos_sim, cos_sim_batch, grad_dist
+from distribution_matching import (
+    RandomMLPProjector,
+    build_dm_projectors,
+    compute_dm_loss,
+)
+from utilities import (
+    align_embeds_to_model,
+    compute_grads_lm,
+    cos_sim,
+    cos_sim_batch,
+    grad_dist,
+)
 
 
 def _args(**overrides):
@@ -33,10 +43,10 @@ class _TinyModel(nn.Module):
 
 
 class _TinyCausalLM(nn.Module):
-    def __init__(self, vocab_size=11, embed_dim=6):
+    def __init__(self, vocab_size=11, embed_dim=6, dtype=torch.float32):
         super().__init__()
-        self.embeddings = nn.Embedding(vocab_size, embed_dim)
-        self.lm_head = nn.Linear(embed_dim, vocab_size)
+        self.embeddings = nn.Embedding(vocab_size, embed_dim, dtype=dtype)
+        self.lm_head = nn.Linear(embed_dim, vocab_size, dtype=dtype)
 
     def get_input_embeddings(self):
         return self.embeddings
@@ -78,7 +88,6 @@ def test_compute_grads_lm_elem_clip_supports_higher_order_backward():
     _assert_higher_order_grad_clip_backward("elem")
 
 
-
 def test_cos_sim_zero_vectors_is_finite():
     value = cos_sim(torch.zeros(4), torch.zeros(4))
     assert torch.isfinite(value)
@@ -101,6 +110,7 @@ def test_grad_dist_all_none_returns_finite_zero_scalar():
     assert value.ndim == 0
     assert torch.isfinite(value)
     assert value.item() == 0.0
+
 
 def test_random_mlp_projector_shape():
     projector = RandomMLPProjector(input_dim=5, feature_dim=7)
@@ -154,6 +164,30 @@ def test_dtype_alignment_preserves_gradient_flow():
     assert syn_embeds.grad.abs().sum() > 0
 
 
+def test_adam_optimizes_fp32_embeds_with_half_precision_forward():
+    torch.manual_seed(0)
+    model = _TinyCausalLM(dtype=torch.float16)
+    x_embeds = torch.randn(2, 3, 6, dtype=torch.float16)
+    x_embeds = x_embeds.detach().clone().float()
+    x_embeds.requires_grad_(True)
+    optimizer = torch.optim.Adam([x_embeds], lr=1e-5)
+    attention_mask = torch.ones(2, 3, dtype=torch.long)
+
+    optimizer.zero_grad()
+    aligned = align_embeds_to_model(x_embeds, model)
+    assert aligned.dtype == torch.float16
+    outputs = model(inputs_embeds=aligned, attention_mask=attention_mask)
+    loss = outputs.logits.float().square().mean()
+    loss.backward()
+
+    assert x_embeds.grad is not None
+    assert torch.isfinite(x_embeds.grad).all()
+    optimizer.step()
+
+    assert x_embeds.dtype == torch.float32
+    assert torch.isfinite(x_embeds).all()
+
+
 def test_dm_loss_logging_value_is_always_defined_in_closure_path():
     args = _args(dm_match="mean")
     projectors = build_dm_projectors(args, lm_embed_dim=3, device=torch.device("cpu"))
@@ -202,6 +236,7 @@ if __name__ == "__main__":
     test_dm_loss_backward_frozen_params_and_class_aware_labels()
     test_dtype_alignment_preserves_gradient_flow()
     test_dm_loss_logging_value_is_always_defined_in_closure_path()
+    test_adam_optimizes_fp32_embeds_with_half_precision_forward()
     test_compute_grads_lm_norm_clip_supports_higher_order_backward()
     test_compute_grads_lm_elem_clip_supports_higher_order_backward()
     print("DM smoke checks passed.")

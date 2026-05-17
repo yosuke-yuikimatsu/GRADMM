@@ -4,12 +4,12 @@ import argparse
 def str2bool(v):
     if isinstance(v, bool):
         return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+    if v.lower() in ("yes", "true", "t", "y", "1"):
         return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+    elif v.lower() in ("no", "false", "f", "n", "0"):
         return False
     else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
+        raise argparse.ArgumentTypeError("Boolean value expected.")
 
 
 def get_args(argv=None):
@@ -17,270 +17,267 @@ def get_args(argv=None):
 
     Returns:
     """
-    parser = argparse.ArgumentParser(description='LAMP attack')
+    parser = argparse.ArgumentParser(description="LAMP attack")
 
     # Method and setting
-    parser.add_argument('--rng_seed', type=int, default=42)
+    parser.add_argument("--rng_seed", type=int, default=42)
     parser.add_argument(
-        '--baseline',
-        action='store_true',
-        help='use baseline defaults + disable all new improvements',
+        "--baseline",
+        action="store_true",
+        help="use baseline defaults + disable all new improvements",
     )
     parser.add_argument(
-        '--dataset',
+        "--dataset",
         choices=[
-            'sst2',
-            'rotten_tomatoes',
-            'TwitterEmotion',
-            'imdb',
-            'rtpolarity',
+            "sst2",
+            "rotten_tomatoes",
+            "TwitterEmotion",
+            "imdb",
+            "rtpolarity",
         ],
         required=True,
     )
-    parser.add_argument('--split', required=True)
+    parser.add_argument("--split", required=True)
+    parser.add_argument("--data_loader", choices=["batch", "cluster"], default="batch")
+    parser.add_argument("--n_clusters", type=int, default=10)
+    parser.add_argument("--loss", choices=["cos", "dlg", "tag"], default="cos")
     parser.add_argument(
-        '--data_loader', choices=['batch', 'cluster'], default='batch'
+        "--embed_loss",
+        choices=["cos", "dlg", "tag", "cos_mapped_embeds"],
+        default="dlg",
     )
-    parser.add_argument('--n_clusters', type=int, default=10)
-    parser.add_argument(
-        '--loss', choices=['cos', 'dlg', 'tag'], default='cos'
-    )
-    parser.add_argument(
-        '--embed_loss',
-        choices=['cos', 'dlg', 'tag', 'cos_mapped_embeds'],
-        default='dlg',
-    )
-    parser.add_argument('-b', '--batch_size', type=int, default=1)
+    parser.add_argument("-b", "--batch_size", type=int, default=1)
     # Frozen params
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
-        '--opt_alg',
-        choices=['adam', 'bfgs', 'bert-adam', 'admm', 'admm_sgd'],
-        default='admm',
+        "--opt_alg",
+        choices=["adam", "bfgs", "bert-adam", "admm", "admm_sgd"],
+        default="admm",
     )
-    parser.add_argument('--n_steps', type=int, default=30)   #
-    parser.add_argument('--init_candidates', type=int, default=500)   #
+    parser.add_argument("--n_steps", type=int, default=30)  #
+    parser.add_argument("--init_candidates", type=int, default=500)  #
     parser.add_argument(
-        '--init',
-        choices=['real_first', 'real_closest', 'random_normal', 'random_embed'],
-        default='random_normal',
+        "--init",
+        choices=["real_first", "real_closest", "random_normal", "random_embed"],
+        default="random_normal",
     )
-    parser.add_argument('--init_size', type=float, default=1.4)   #
+    parser.add_argument("--init_size", type=float, default=1.4)  #
     parser.add_argument(
-        '--lr_decay_type',
+        "--lr_decay_type",
         type=str,
-        default='StepLR',
-        choices=['StepLR', 'LambdaLR'],
+        default="StepLR",
+        choices=["StepLR", "LambdaLR"],
     )
 
     # Tuneable params
     # Ours:             coeff_preplexity, coeff_reg, lr, lr_decay
     # Baselines:      lr, lr_decay, tag_factor
-    parser.add_argument('--coeff_perplexity', type=float, default=0.0)   #
-    parser.add_argument('--coeff_reg', type=float, default=0.0)   #
+    parser.add_argument("--coeff_perplexity", type=float, default=0.0)  #
+    parser.add_argument("--coeff_reg", type=float, default=0.0)  #
     parser.add_argument(
-        '--lr', type=float, default=0.008
-    )   # TAG best: 0.1 (for admm 0.008)
-    parser.add_argument('--lr_decay', type=float, default=0.9)   # TAG best: 0.985
+        "--lr", type=float, default=0.008
+    )  # TAG best: 0.1 (for admm 0.008)
+    parser.add_argument("--lr_decay", type=float, default=0.9)  # TAG best: 0.985
     parser.add_argument(
-        '--admm_rho', type=float, default=0.7
-    )   # Possible range 10 - 0.001
+        "--admm_rho", type=float, default=0.7
+    )  # Possible range 10 - 0.001
     parser.add_argument(
-        '--admm_inner_steps', type=int, default=10
-    )   # Possible range 10 - 200
+        "--admm_inner_steps", type=int, default=10
+    )  # Possible range 10 - 200
+    parser.add_argument("--tag_factor", type=float, default=None)  # TAG best: 1e-3
     parser.add_argument(
-        '--tag_factor', type=float, default=None
-    )   # TAG best: 1e-3
+        "--grad_clip", type=float, default=None
+    )  # TAG best: 1, ours 0.5, only applicable to BERT_Large
+    parser.add_argument("--lr_max_it", type=int, default=None)
     parser.add_argument(
-        '--grad_clip', type=float, default=None
-    )   # TAG best: 1, ours 0.5, only applicable to BERT_Large
-    parser.add_argument('--lr_max_it', type=int, default=None)
-    parser.add_argument(
-        '--embed_value_clip',
+        "--embed_value_clip",
         type=float,
         default=None,
-        help='optional ADMM debugging/stability clamp for x/z/lambda embeddings',
+        help="optional ADMM debugging/stability clamp for x/z/lambda embeddings",
     )
     parser.add_argument(
-        '--force_float32_model',
+        "--force_float32_model",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         const=True,
         default=False,
-        help='load the LM with torch.float32 for numerical debugging at higher VRAM cost',
+        help="load the LM with torch.float32 for numerical debugging at higher VRAM cost",
+    )
+    parser.add_argument(
+        "--optimize_embeds_float32",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="optimize synthetic embeddings as fp32 leaf tensors even when the LM runs in fp16",
     )
 
     # Debug params
-    parser.add_argument('--print_every', type=int, default=10)
+    parser.add_argument("--print_every", type=int, default=10)
 
     # addtional params for data generation
-    parser.add_argument('--model_name', type=str, default='phi')
-    parser.add_argument('--n_gen', type=int, default=10)
+    parser.add_argument("--model_name", type=str, default="phi")
+    parser.add_argument("--n_gen", type=int, default=10)
     parser.add_argument(
-        '--gen_max_tokens', type=int, default=30
-    )   # include prompt length
+        "--gen_max_tokens", type=int, default=30
+    )  # include prompt length
     parser.add_argument(
-        '--use_auto_gen_tokens',
+        "--use_auto_gen_tokens",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         const=True,
         default=False,
     )
     parser.add_argument(
-        '--gen_grad_clip',
+        "--gen_grad_clip",
         type=str,
-        default='',
-        help='grad clip for calculating matching gradient',
-    )   # "": no clip, "norm": clip by norm, "elem": clip by element -1, 1
+        default="",
+        help="grad clip for calculating matching gradient",
+    )  # "": no clip, "norm": clip by norm, "elem": clip by element -1, 1
     parser.add_argument(
-        '--gen_bs', type=int, default=1
-    )   # number of embeddings to generate per time
-    parser.add_argument('--n_gen_samples', type=int, default=1000)
-    parser.add_argument('--subset_size', type=int, default=100)
-    parser.add_argument('--n_fewshot', type=int, default=0)
+        "--gen_bs", type=int, default=1
+    )  # number of embeddings to generate per time
+    parser.add_argument("--n_gen_samples", type=int, default=1000)
+    parser.add_argument("--subset_size", type=int, default=100)
+    parser.add_argument("--n_fewshot", type=int, default=0)
     parser.add_argument(
-        '--work_base_dir',
+        "--work_base_dir",
         type=str,
-        default='./synthetic_data/',
+        default="./synthetic_data/",
     )
-    parser.add_argument('--alpha', type=float, default=0.001)
-    parser.add_argument('--topk', type=int, default=50)
+    parser.add_argument("--alpha", type=float, default=0.001)
+    parser.add_argument("--topk", type=int, default=50)
 
     parser.add_argument(
-        '--overwrite',
+        "--overwrite",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         const=True,
         default=False,
     )
-    parser.add_argument('--save_every', type=int, default=1)
+    parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument(
-        '--drop_non_english_tokens',
+        "--drop_non_english_tokens",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=False,
     )
     parser.add_argument(
-        '--use_sample_tokens_only',
+        "--use_sample_tokens_only",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=False,
     )
     parser.add_argument(
-        '--use_topk',
+        "--use_topk",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         const=True,
         default=False,
     )
     parser.add_argument(
-        '--independent_gen',
+        "--independent_gen",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=True,
     )
     parser.add_argument(
-        '--print_full',
+        "--print_full",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=True,
     )
     parser.add_argument(
-        '--include_prefix',
+        "--include_prefix",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=False,
     )
+    parser.add_argument("--prefix_option", choices=["fixed", "random"], default="fixed")
     parser.add_argument(
-        '--prefix_option', choices=['fixed', 'random'], default='fixed'
+        "--conversion_method", choices=["proj", "topk", "concat"], default="topk"
     )
+    parser.add_argument("--n_prefix", type=int, default=1)
+    parser.add_argument("--reg_loss_type", choices=["norm", "embed"], default="norm")
     parser.add_argument(
-        '--conversion_method', choices=['proj', 'topk', 'concat'], default='topk'
-    )
-    parser.add_argument('--n_prefix', type=int, default=1)
-    parser.add_argument(
-        '--reg_loss_type', choices=['norm', 'embed'], default='norm'
-    )
-    parser.add_argument(
-        '--last_layer_gradient',
+        "--last_layer_gradient",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=True,
     )
-    parser.add_argument('--skip_first_samples', type=int, default=0)
+    parser.add_argument("--skip_first_samples", type=int, default=0)
     parser.add_argument(
-        '--drop_change_line_characters',
+        "--drop_change_line_characters",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=True,
     )
-
 
     # Distribution Matching (DM) extension
     parser.add_argument(
-        '--use_dm',
+        "--use_dm",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         const=True,
         default=False,
     )
-    parser.add_argument('--dm_weight', type=float, default=0.0)
+    parser.add_argument("--dm_weight", type=float, default=0.0)
     parser.add_argument(
-        '--dm_mode', choices=['regularizer', 'standalone'], default='regularizer'
+        "--dm_mode", choices=["regularizer", "standalone"], default="regularizer"
     )
     parser.add_argument(
-        '--dm_projector',
-        choices=['mlp', 'tiny_transformer', 'random_bert'],
-        default='mlp',
+        "--dm_projector",
+        choices=["mlp", "tiny_transformer", "random_bert"],
+        default="mlp",
     )
-    parser.add_argument('--dm_feature_dim', type=int, default=256)
-    parser.add_argument('--dm_num_projectors', type=int, default=1)
-    parser.add_argument('--dm_resample_every', type=int, default=0)
+    parser.add_argument("--dm_feature_dim", type=int, default=256)
+    parser.add_argument("--dm_num_projectors", type=int, default=1)
+    parser.add_argument("--dm_resample_every", type=int, default=0)
     parser.add_argument(
-        '--dm_match', choices=['mean', 'mean_var', 'mmd'], default='mean'
+        "--dm_match", choices=["mean", "mean_var", "mmd"], default="mean"
     )
     parser.add_argument(
-        '--dm_by_class',
+        "--dm_by_class",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         const=True,
         default=True,
     )
     parser.add_argument(
-        '--dm_detach_real_features',
+        "--dm_detach_real_features",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         const=True,
         default=True,
     )
-    parser.add_argument('--dm_real_batch_size', type=int, default=32)
-    parser.add_argument('--dm_pooling', choices=['mean', 'last'], default='mean')
+    parser.add_argument("--dm_real_batch_size", type=int, default=32)
+    parser.add_argument("--dm_pooling", choices=["mean", "last"], default="mean")
 
     parser.add_argument(
-        '--use_dp',
+        "--use_dp",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=False,
     )
     parser.add_argument(
-        '--dp_c',
+        "--dp_c",
         type=float,
         default=1.0,
     )
     parser.add_argument(
-        '--dp_epsilon',
+        "--dp_epsilon",
         type=float,
         default=0.05,
     )
     parser.add_argument(
-        '--dp_delta',
+        "--dp_delta",
         type=float,
         default=1e-4,
     )
     parser.add_argument(
-        '--save_avg_grad',
+        "--save_avg_grad",
         type=str2bool,
-        nargs='?',
+        nargs="?",
         default=False,
     )
 
