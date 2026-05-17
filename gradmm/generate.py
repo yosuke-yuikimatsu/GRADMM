@@ -12,13 +12,14 @@ import regex as re
 import wandb
 import torch
 from torch import optim
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from args_factory import get_args
 from data_utils import BatchDatasetLoader, TextDataset
 from distribution_matching import build_dm_projectors, compute_dm_loss
 from init import get_init_lm
 from utilities import (
+    align_embeds_to_model,
     compute_grads_lm,
     cos_sim,
     count_lines,
@@ -113,6 +114,15 @@ def get_loss(
     return return_dict
 
 
+def _resolve_pad_token_id(tokenizer):
+    """Choose a safe pad token id before model construction."""
+    if tokenizer.pad_token_id is not None:
+        return tokenizer.pad_token_id
+    if tokenizer.eos_token_id is not None:
+        return tokenizer.eos_token_id
+    return 0
+
+
 def prepare_real_dm_batch(args, model, tokenizer, sequences, labels, device):
     """Prepare real examples in the active LM embedding space for DM."""
     if sequences is None or labels is None or len(sequences) == 0:
@@ -139,6 +149,7 @@ def prepare_real_dm_batch(args, model, tokenizer, sequences, labels, device):
     ).to(device)
     with torch.no_grad():
         real_embeds = model.get_input_embeddings()(batch["input_ids"]).detach()
+    real_embeds = align_embeds_to_model(real_embeds, model)
     real_labels = torch.as_tensor(labels, device=device).view(-1).long()
     return real_embeds, batch["attention_mask"].long(), real_labels
 
@@ -427,6 +438,7 @@ def generation(
             dm_projectors = build_dm_projectors(args, x_embeds.shape[-1], device)
         
         t_start = time.time()
+        dm_loss_value = 0.0
         if args.opt_alg == "admm":
             # x + rho^-1 * lambda
             intermediate_embeds = x_embeds.data.clone().detach()
@@ -481,6 +493,7 @@ def generation(
             z_embeds.data[:] = lm_embeddings(z_ids.unsqueeze(0)).detach().clone()
 
             def closure():
+                nonlocal dm_loss_value
                 opt.zero_grad()
                 if args.use_dm and args.dm_mode == "standalone":
                     rec_loss = x_embeds.new_zeros(())
@@ -529,6 +542,7 @@ def generation(
                         attention_mask,
                         syn_dm_labels,
                     )
+                    dm_loss_value = float(dm_loss.detach().cpu())
                 # one step update of x
                 if args.use_dm and args.dm_mode == "standalone":
                     tot_loss = (
@@ -628,7 +642,7 @@ def generation(
                 f" {rec_loss.item()}, reg_loss = {reg_loss.item()},"
                 f" embed_loss = {embed_diff.item()}, tot_loss = {error.item()}"
                 f" perp_loss = {perp_loss.item()}"
-                f" dm_loss = {dm_loss.item()}"
+                f" dm_loss = {dm_loss_value}"
                 f" rec_loss_embeds = {loss_dict['rec_loss_embeds'].item()}"
                 f" rec_loss_ids = {loss_dict['rec_loss_ids'].item()}"
                 f" perplexity = {loss_dict['perplexity'].item()}"
@@ -639,6 +653,7 @@ def generation(
             )
         else:
             def closure():
+                nonlocal dm_loss_value
                 opt.zero_grad()
                 if args.use_dm and args.dm_mode == "standalone":
                     rec_loss = x_embeds.new_zeros(())
@@ -746,6 +761,7 @@ def generation(
                         attention_mask,
                         syn_dm_labels,
                     )
+                    dm_loss_value = float(dm_loss.detach().cpu())
                 if args.use_dm and args.dm_mode == "standalone":
                     tot_loss = args.dm_weight * dm_loss + args.coeff_reg * reg_loss
                 else:
@@ -883,7 +899,7 @@ def generation(
                         best_reg_loss,
                         best_norm_diff,
                         best_embed_diff,
-                        dm_loss.item() if args.use_dm else 0.0,
+                        dm_loss_value,
                         tot_loss.item(),
                         perplexity.item(),
                         rec_loss_embeds.item(),
@@ -1413,8 +1429,20 @@ def main():
     device = torch.device(args.device)
     model, tokenizer = None, None
 
+    model_id = MODEL_MAP[args.model_name]
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    tokenizer.padding_side = "left"
+    pad_token_id = _resolve_pad_token_id(tokenizer)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = pad_token_id
+
+    config = AutoConfig.from_pretrained(model_id)
+    config.pad_token_id = pad_token_id
+
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_MAP[args.model_name],
+        model_id,
+        config=config,
         device_map="auto",
     )
     # Set gradient for only last layers
@@ -1429,12 +1457,9 @@ def main():
         assert len(named_parameters_to_optim) != 0, "no layer found"
         print(f"Set gradients for {len(named_parameters_to_optim)} layers")
     
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_MAP[args.model_name], use_fast=True
-    )
-    tokenizer.padding_side = "left"
-    tokenizer.pad_token_id = 0
-    model.generation_config.pad_token_id = tokenizer.pad_token_id
+    model.generation_config.pad_token_id = pad_token_id
+    if getattr(model.config, "pad_token_id", None) is None:
+        model.config.pad_token_id = pad_token_id
 
     print("\n\ngenerating..\n", flush=True)
 
