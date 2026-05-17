@@ -16,6 +16,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from args_factory import get_args
 from data_utils import BatchDatasetLoader, TextDataset
+from distribution_matching import build_dm_projectors, compute_dm_loss
 from init import get_init_lm
 from utilities import (
     compute_grads_lm,
@@ -112,6 +113,36 @@ def get_loss(
     return return_dict
 
 
+def prepare_real_dm_batch(args, model, tokenizer, sequences, labels, device):
+    """Prepare real examples in the active LM embedding space for DM."""
+    if sequences is None or labels is None or len(sequences) == 0:
+        return None, None, None
+
+    max_examples = min(len(sequences), args.dm_real_batch_size)
+    sequences = list(sequences[:max_examples])
+    labels = labels[:max_examples]
+
+    if args.dataset in ["sst2", "rotten_tomatoes", "imdb", "rtpolarity"]:
+        prompted_sequences = [seq + " It was " for seq in sequences]
+    elif args.dataset == "TwitterEmotion":
+        prompted_sequences = [
+            seq + " Does the tweet express joy or sadness?\n" for seq in sequences
+        ]
+    else:
+        raise ValueError("Unsupported dataset: %s" % args.dataset)
+
+    batch = tokenizer(
+        prompted_sequences,
+        padding=True,
+        truncation=True,
+        return_tensors="pt",
+    ).to(device)
+    with torch.no_grad():
+        real_embeds = model.get_input_embeddings()(batch["input_ids"]).detach()
+    real_labels = torch.as_tensor(labels, device=device).view(-1).long()
+    return real_embeds, batch["attention_mask"].long(), real_labels
+
+
 def generation(
     args,
     device,
@@ -129,6 +160,8 @@ def generation(
     list_prefix,
     only_init=False,
     previous_grad=None,
+    dm_sequences=None,
+    dm_labels=None,
 ):
     """Generate synthetic data.
 
@@ -309,6 +342,22 @@ def generation(
 
     lm_embeddings_weight = lm_embeddings.weight.unsqueeze(0)
 
+    dm_projectors = None
+    real_dm_embeds, real_dm_attention_mask, real_dm_labels = (None, None, None)
+    syn_dm_labels = torch.as_tensor(true_labels, device=device).view(-1).long()
+    if syn_dm_labels.numel() != x_embeds.shape[0]:
+        repeats = math.ceil(x_embeds.shape[0] / max(1, syn_dm_labels.numel()))
+        syn_dm_labels = syn_dm_labels.repeat(repeats)[: x_embeds.shape[0]]
+    if args.use_dm:
+        real_dm_embeds, real_dm_attention_mask, real_dm_labels = prepare_real_dm_batch(
+            args, model, tokenizer, dm_sequences, dm_labels, device
+        )
+        if real_dm_embeds is None:
+            real_dm_embeds = x_embeds.detach().clone()
+            real_dm_attention_mask = attention_mask.detach().clone()
+            real_dm_labels = syn_dm_labels.detach().clone()
+        dm_projectors = build_dm_projectors(args, x_embeds.shape[-1], device)
+
     # for admm
     z_embeds = torch.zeros_like(x_embeds)
     lambda_embeds = torch.zeros_like(x_embeds)
@@ -369,6 +418,13 @@ def generation(
             )
         else:
             x_embeds.data[:, -prompt_len:, :] = prompt_embeddings.detach().clone()
+        if (
+            args.use_dm
+            and args.dm_resample_every > 0
+            and it > 0
+            and it % args.dm_resample_every == 0
+        ):
+            dm_projectors = build_dm_projectors(args, x_embeds.shape[-1], device)
         
         t_start = time.time()
         if args.opt_alg == "admm":
@@ -426,16 +482,19 @@ def generation(
 
             def closure():
                 opt.zero_grad()
-                rec_loss = get_reconstruction_loss(
-                    model,
-                    x_embeds,
-                    attention_mask,
-                    true_labels_tokenized,
-                    true_grads,
-                    args,
-                    create_graph=True,
-                    previous_grad=previous_grad,
-                )
+                if args.use_dm and args.dm_mode == "standalone":
+                    rec_loss = x_embeds.new_zeros(())
+                else:
+                    rec_loss = get_reconstruction_loss(
+                        model,
+                        x_embeds,
+                        attention_mask,
+                        true_labels_tokenized,
+                        true_grads,
+                        args,
+                        create_graph=True,
+                        previous_grad=previous_grad,
+                    )
                 norm_diff = (x_embeds.norm(p=2, dim=2).mean() - args.init_size).square()
                 
                 if args.reg_loss_type == "norm":
@@ -447,9 +506,9 @@ def generation(
                         embed_diff = (x_embeds.mean(dim=1) - avg_embeds).square().sum()
                     else:
                         # No regularization
-                        embed_diff = torch.zeros(1)
+                        embed_diff = x_embeds.new_zeros(())
                 else:
-                    embed_diff = torch.zeros(1)
+                    embed_diff = x_embeds.new_zeros(())
                 
                 reg_loss = (
                     (x_embeds - z_embeds + (1 / args.admm_rho) * lambda_embeds)
@@ -458,13 +517,35 @@ def generation(
                 )
                 # perplexity loss
                 perp_loss = get_perplexity_loss(x_embeds, z_ids, model)
+                dm_loss = x_embeds.new_zeros(())
+                if args.use_dm:
+                    dm_loss = compute_dm_loss(
+                        args,
+                        dm_projectors,
+                        real_dm_embeds,
+                        real_dm_attention_mask,
+                        real_dm_labels,
+                        x_embeds,
+                        attention_mask,
+                        syn_dm_labels,
+                    )
                 # one step update of x
-                tot_loss = (
-                    rec_loss
-                    + (args.admm_rho / 2) * reg_loss
-                    + args.coeff_reg * embed_diff
-                    + args.coeff_perplexity * perp_loss
-                )
+                if args.use_dm and args.dm_mode == "standalone":
+                    tot_loss = (
+                        args.dm_weight * dm_loss
+                        + (args.admm_rho / 2) * reg_loss
+                        + args.coeff_reg * embed_diff
+                        + args.coeff_perplexity * perp_loss
+                    )
+                else:
+                    tot_loss = (
+                        rec_loss
+                        + (args.admm_rho / 2) * reg_loss
+                        + args.coeff_reg * embed_diff
+                        + args.coeff_perplexity * perp_loss
+                    )
+                    if args.use_dm:
+                        tot_loss = tot_loss + args.dm_weight * dm_loss
                 tot_loss.backward()
                 # print(f"----Inner ADMM step: total loss {tot_loss.item()}, rec_loss {rec_loss.item()}, admm_item {(args.admm_rho / 2) * reg_loss.item()}, embed_diff {args.coeff_reg * embed_diff}, perp loss {args.coeff_perplexity * perp_loss}")
                 if args.dataset in ["rotten_tomatoes", "imdb", "rtpolarity"]:
@@ -476,10 +557,10 @@ def generation(
                         if grad_norm > args.grad_clip:
                             x_embeds.grad.mul_(args.grad_clip / (grad_norm + 1e-6))  # pytype: disable=attribute-error
 
-                return tot_loss, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss
+                return tot_loss, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss, dm_loss
 
             for _ in range(args.admm_inner_steps):
-                error, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss = opt.step(
+                error, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss, dm_loss = opt.step(
                     closure
                 )
             
@@ -547,6 +628,7 @@ def generation(
                 f" {rec_loss.item()}, reg_loss = {reg_loss.item()},"
                 f" embed_loss = {embed_diff.item()}, tot_loss = {error.item()}"
                 f" perp_loss = {perp_loss.item()}"
+                f" dm_loss = {dm_loss.item()}"
                 f" rec_loss_embeds = {loss_dict['rec_loss_embeds'].item()}"
                 f" rec_loss_ids = {loss_dict['rec_loss_ids'].item()}"
                 f" perplexity = {loss_dict['perplexity'].item()}"
@@ -558,16 +640,19 @@ def generation(
         else:
             def closure():
                 opt.zero_grad()
-                rec_loss = get_reconstruction_loss(
-                    model,
-                    x_embeds,
-                    attention_mask,
-                    true_labels_tokenized,
-                    true_grads,
-                    args,
-                    create_graph=True,
-                    previous_grad=previous_grad,
-                )
+                if args.use_dm and args.dm_mode == "standalone":
+                    rec_loss = x_embeds.new_zeros(())
+                else:
+                    rec_loss = get_reconstruction_loss(
+                        model,
+                        x_embeds,
+                        attention_mask,
+                        true_labels_tokenized,
+                        true_grads,
+                        args,
+                        create_graph=True,
+                        previous_grad=previous_grad,
+                    )
                 norm_diff = (x_embeds.norm(p=2, dim=2).mean() - args.init_size).square()
                 if args.embed_loss == "cos":
                     embed_diff = 1 - cos_sim(x_embeds.mean(dim=1), avg_embeds)
@@ -649,16 +734,33 @@ def generation(
                 #     f"rec_loss: {rec_loss.item()} norm_diff:"
                 #     f" {norm_diff.item()} embed_diff: {embed_diff.item()}"
                 # )
-                tot_loss = rec_loss + args.coeff_reg * reg_loss
+                dm_loss = x_embeds.new_zeros(())
+                if args.use_dm:
+                    dm_loss = compute_dm_loss(
+                        args,
+                        dm_projectors,
+                        real_dm_embeds,
+                        real_dm_attention_mask,
+                        real_dm_labels,
+                        x_embeds,
+                        attention_mask,
+                        syn_dm_labels,
+                    )
+                if args.use_dm and args.dm_mode == "standalone":
+                    tot_loss = args.dm_weight * dm_loss + args.coeff_reg * reg_loss
+                else:
+                    tot_loss = rec_loss + args.coeff_reg * reg_loss
+                    if args.use_dm:
+                        tot_loss = tot_loss + args.dm_weight * dm_loss
                 tot_loss.backward(retain_graph=True)
                 with torch.no_grad():
                     if args.grad_clip is not None:
                         grad_norm = x_embeds.grad.norm()  # pytype: disable=attribute-error
                         if grad_norm > args.grad_clip:
                             x_embeds.grad.mul_(args.grad_clip / (grad_norm + 1e-6))  # pytype: disable=attribute-error
-                return tot_loss, norm_diff, embed_diff, rec_loss, reg_loss
+                return tot_loss, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss
 
-            error, norm_diff, embed_diff, rec_loss, reg_loss = opt.step(closure)
+            error, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss = opt.step(closure)
 
         if isinstance(prompt_embeddings, list):
             # First prompt
@@ -683,7 +785,7 @@ def generation(
             best_rec_loss = rec_loss.item()
             best_reg_loss = reg_loss.item()
             best_final_x.data[:] = x_embeds.data[:]
-        del error, norm_diff, embed_diff, rec_loss, reg_loss
+        del error, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss
 
         lr_scheduler.step()
 
@@ -771,7 +873,7 @@ def generation(
                 print(
                     "[%4d/%4d] best_final_error=%.3f, best_rec_loss=%.3f,"
                     " best_reg_loss=%.3f,  norm_diff=%.3f,"
-                    " embed_diff=%.3f, tot_loss=%.3f (perp=%.3f, rec_embeds=%.3f,"
+                    " embed_diff=%.3f, dm_loss=%.3f, tot_loss=%.3f (perp=%.3f, rec_embeds=%.3f,"
                     " rec_ids=%.3f) embed_diff_ids=%.3f [t=%.2fs]"
                     % (
                         steps_done,
@@ -781,6 +883,7 @@ def generation(
                         best_reg_loss,
                         best_norm_diff,
                         best_embed_diff,
+                        dm_loss.item() if args.use_dm else 0.0,
                         tot_loss.item(),
                         perplexity.item(),
                         rec_loss_embeds.item(),
@@ -1537,6 +1640,8 @@ def main():
             unique_prefixes,
             only_init=True if i < args.skip_first_samples else False,
             previous_grad=pos_previous_grad,
+            dm_sequences=pos_sequences,
+            dm_labels=pos_labels,
         )
         # Negative generation
         print("Negative average sequence length", np.mean(neg_prompt_lengths))
@@ -1560,6 +1665,8 @@ def main():
             unique_prefixes,
             only_init=True if i < args.skip_first_samples else False,
             previous_grad=neg_previous_grad,
+            dm_sequences=neg_sequences,
+            dm_labels=neg_labels,
         )
         if i < args.skip_first_samples:
             continue
