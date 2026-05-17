@@ -29,6 +29,41 @@ cd gradmm
 
 For filtering, please refer to the notebook `gradmm/Filtering.ipynb`. Adjust the settings in the `Parameters` section, then run all cells in the notebook.
 
+### Distribution Matching Extension
+
+This repository also includes an optional experimental Dataset Condensation with Distribution Matching (DM) objective. DM matches real and synthetic feature distributions after passing LM input embeddings through frozen random projectors. It can be used as a regularizer on top of the existing GRADMM/ADMM gradient-matching objective, or as a standalone objective with `--dm_mode standalone`.
+
+The default GRADMM behavior is unchanged unless `--use_dm True` is set. A basic DM-regularized generation run is available via:
+
+```bash
+cd gradmm
+./scripts/dm.sh
+```
+
+You can also add DM flags to an existing generation command, for example:
+
+```bash
+python generate.py \
+  --dataset sst2 \
+  --split validation \
+  --use_dm True \
+  --dm_mode regularizer \
+  --dm_weight 1.0 \
+  --dm_projector mlp \
+  --dm_match mean
+```
+
+For a randomly initialized BERT feature space, use a smaller weight to limit overhead:
+
+```bash
+python generate.py \
+  --dataset sst2 \
+  --split validation \
+  --use_dm True \
+  --dm_projector random_bert \
+  --dm_weight 0.1
+```
+
 ## Finetuning
 1. Obtain the synthetic data paths by running the `Print fine-tuning paths` section in the notebook `gradmm/Finetuning.ipynb`.
 

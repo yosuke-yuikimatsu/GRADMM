@@ -69,6 +69,14 @@ def get_args_flags(args):
     flags += f"-{args.opt_alg}"
     if args.use_dp:
         flags += f"-dp_eps{args.dp_epsilon}"
+    if getattr(args, 'use_dm', False):
+        flags += f"-dm_{args.dm_mode}_{args.dm_projector}"
+        flags += f"_w{args.dm_weight}_match{args.dm_match}"
+        flags += f"_fd{args.dm_feature_dim}_np{args.dm_num_projectors}"
+        if args.dm_resample_every > 0:
+            flags += f"_rs{args.dm_resample_every}"
+        if args.dm_by_class:
+            flags += "_byclass"
     flags += f"-rho{args.admm_rho}"
     flags += f"-inner{args.admm_inner_steps}"
     flags += f"-seed{args.rng_seed}"

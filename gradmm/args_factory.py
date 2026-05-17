@@ -201,6 +201,47 @@ def get_args(argv=None):
         default=True,
     )
 
+
+    # Distribution Matching (DM) extension
+    parser.add_argument(
+        '--use_dm',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=False,
+    )
+    parser.add_argument('--dm_weight', type=float, default=0.0)
+    parser.add_argument(
+        '--dm_mode', choices=['regularizer', 'standalone'], default='regularizer'
+    )
+    parser.add_argument(
+        '--dm_projector',
+        choices=['mlp', 'tiny_transformer', 'random_bert'],
+        default='mlp',
+    )
+    parser.add_argument('--dm_feature_dim', type=int, default=256)
+    parser.add_argument('--dm_num_projectors', type=int, default=1)
+    parser.add_argument('--dm_resample_every', type=int, default=0)
+    parser.add_argument(
+        '--dm_match', choices=['mean', 'mean_var', 'mmd'], default='mean'
+    )
+    parser.add_argument(
+        '--dm_by_class',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=True,
+    )
+    parser.add_argument(
+        '--dm_detach_real_features',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=True,
+    )
+    parser.add_argument('--dm_real_batch_size', type=int, default=32)
+    parser.add_argument('--dm_pooling', choices=['mean', 'last'], default='mean')
+
     parser.add_argument(
         '--use_dp',
         type=str2bool,
