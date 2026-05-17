@@ -61,6 +61,15 @@ def init_empty_run_state(args):
     return summary_metrics, pos_generations, neg_generations
 
 
+def _ids_for_lm_embeddings(ids, name="ids"):
+    """Return token ids with the batch dimension expected by LM embeddings."""
+    if ids.ndim == 1:
+        return ids.unsqueeze(0)
+    if ids.ndim == 2:
+        return ids
+    raise ValueError(f"Unexpected {name} shape: {ids.shape}")
+
+
 def _copy_prompt_embeddings(
     x_embeds, prompt_embeddings, prompt_len, first_prompt_end_index
 ):
@@ -568,9 +577,10 @@ def generation(
                 # print("z_ids.shape", z_ids.shape)
                 # print("prompt_ids.shape", prompt_ids.shape)
                 z_ids[:, -prompt_len:] = prompt_ids  # shape: (gen_tokens,)
+            z_ids_for_embed = _ids_for_lm_embeddings(z_ids, name="z_ids")
             with torch.no_grad():
                 z_embeds.copy_(
-                    lm_embeddings(z_ids.unsqueeze(0))
+                    lm_embeddings(z_ids_for_embed)
                     .detach()
                     .to(dtype=z_embeds.dtype, device=z_embeds.device)
                 )
@@ -831,7 +841,10 @@ def generation(
                     else:
                         proj_ids[:, -prompt_len:] = prompt_ids  # shape: (gen_tokens,)
                     # print("Calulating mapped true embeds!")
-                    mapped_true_embeds = lm_embeddings(proj_ids)
+                    proj_ids_for_embed = _ids_for_lm_embeddings(
+                        proj_ids, name="proj_ids"
+                    )
+                    mapped_true_embeds = lm_embeddings(proj_ids_for_embed)
                     # perplexity loss
                     perp_loss = get_perplexity_loss(x_embeds, proj_ids, model)
                     cos_sim_reg = 1 - cos_sim(x_embeds, mapped_true_embeds)

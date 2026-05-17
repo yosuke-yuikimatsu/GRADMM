@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
+from generate import _ids_for_lm_embeddings
 from distribution_matching import (
     RandomMLPProjector,
     build_dm_projectors,
@@ -227,6 +228,38 @@ def test_dm_loss_logging_value_is_always_defined_in_closure_path():
     assert syn_embeds.grad is not None
 
 
+def test_ids_for_lm_embeddings_preserves_batched_admm_ids_for_all_conversions():
+    embeddings = nn.Embedding(13, 5)
+    for conversion_method in ("topk", "concat", "proj"):
+        for batch_size in (1, 3):
+            token_ids = torch.arange(batch_size * 4).view(batch_size, 4)
+            z_embeds = torch.empty(batch_size, 4, 5)
+
+            embeds = embeddings(_ids_for_lm_embeddings(token_ids, name="z_ids"))
+            z_embeds.copy_(embeds)
+
+            assert z_embeds.shape == (batch_size, 4, 5), conversion_method
+
+
+def test_ids_for_lm_embeddings_adds_batch_only_for_unbatched_ids():
+    embeddings = nn.Embedding(13, 5)
+    token_ids = torch.arange(4)
+    embeds = embeddings(_ids_for_lm_embeddings(token_ids, name="z_ids"))
+
+    assert embeds.shape == (1, 4, 5)
+
+
+def test_ids_for_lm_embeddings_rejects_extra_admm_dimension():
+    token_ids = torch.zeros(1, 1, 4, dtype=torch.long)
+
+    try:
+        _ids_for_lm_embeddings(token_ids, name="z_ids")
+    except ValueError as exc:
+        assert "Unexpected z_ids shape" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for rank-3 token ids")
+
+
 if __name__ == "__main__":
     test_cos_sim_zero_vectors_is_finite()
     test_cos_sim_batch_zero_rows_is_finite()
@@ -239,4 +272,7 @@ if __name__ == "__main__":
     test_adam_optimizes_fp32_embeds_with_half_precision_forward()
     test_compute_grads_lm_norm_clip_supports_higher_order_backward()
     test_compute_grads_lm_elem_clip_supports_higher_order_backward()
+    test_ids_for_lm_embeddings_preserves_batched_admm_ids_for_all_conversions()
+    test_ids_for_lm_embeddings_adds_batch_only_for_unbatched_ids()
+    test_ids_for_lm_embeddings_rejects_extra_admm_dimension()
     print("DM smoke checks passed.")
