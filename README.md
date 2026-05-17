@@ -64,41 +64,106 @@ python generate.py \
   --dm_weight 0.1
 ```
 
-### Colab/Kaggle DM Smoke Test
+### Stable DM smoke tests
 
-The following small SST-2 validation run disables WandB login, exercises `--model_name phi`, and should log `dm_loss` while saving outputs under `synthetic_data/smoke_dm_mlp/...`:
+These checks are ordered from cheapest to most numerically demanding. The stabilizing flags are optional and are mainly intended for debugging: `--force_float32_model true` loads the language model in fp32 and may require more VRAM, while `--embed_value_clip` clamps ADMM embedding variables after updates.
+
+#### A. CPU unit tests
 
 ```bash
+cd gradmm
+python test_dm_smoke.py
+```
+
+#### B. Adam DM smoke test (recommended first)
+
+```bash
+cd gradmm
 WANDB_MODE=disabled WANDB_DISABLED=true CUDA_VISIBLE_DEVICES=0 python generate.py \
   --rng_seed 42 \
   --dataset sst2 \
   --split validation \
   --batch_size 4 \
-  --n_steps 2 \
+  --n_steps 5 \
   --n_gen_samples 4 \
   --subset_size 4 \
   --n_gen 2 \
   --gen_bs 2 \
+  --init_candidates 5 \
   --use_auto_gen_tokens true \
-  --print_full true \
+  --print_full false \
   --print_every 1 \
   --save_every 1 \
   --model_name phi \
-  --opt_alg admm \
-  --admm_rho 0.5 \
-  --admm_inner_steps 2 \
-  --work_base_dir ./synthetic_data/smoke_dm_mlp \
-  --grad_clip 1.0 \
-  --topk 50 \
+  --opt_alg adam \
+  --loss dlg \
+  --embed_loss dlg \
+  --lr 0.00001 \
+  --work_base_dir ./synthetic_data/smoke_dm_adam_5steps \
+  --overwrite true \
+  --grad_clip 0.05 \
+  --gen_grad_clip "" \
+  --topk 20 \
   --use_dm true \
   --dm_mode regularizer \
-  --dm_weight 1.0 \
+  --dm_weight 0.01 \
   --dm_projector mlp \
+  --dm_feature_dim 32 \
   --dm_match mean \
   --dm_num_projectors 1 \
   --dm_by_class true \
   --dm_real_batch_size 4
 ```
+
+#### C. Conservative ADMM smoke test (after Adam works)
+
+```bash
+cd gradmm
+WANDB_MODE=disabled WANDB_DISABLED=true CUDA_VISIBLE_DEVICES=0 python generate.py \
+  --rng_seed 42 \
+  --dataset sst2 \
+  --split validation \
+  --batch_size 4 \
+  --n_steps 1 \
+  --n_gen_samples 4 \
+  --subset_size 4 \
+  --n_gen 2 \
+  --gen_bs 2 \
+  --init_candidates 5 \
+  --use_auto_gen_tokens true \
+  --print_full false \
+  --print_every 1 \
+  --save_every 1 \
+  --model_name phi \
+  --opt_alg admm \
+  --loss dlg \
+  --embed_loss dlg \
+  --admm_rho 1.0 \
+  --admm_inner_steps 1 \
+  --lr 0.00001 \
+  --work_base_dir ./synthetic_data/smoke_dm_admm_safe \
+  --overwrite true \
+  --grad_clip 0.05 \
+  --gen_grad_clip "" \
+  --topk 20 \
+  --drop_non_english_tokens true \
+  --use_dm true \
+  --dm_mode regularizer \
+  --dm_weight 0.01 \
+  --dm_projector mlp \
+  --dm_feature_dim 32 \
+  --dm_match mean \
+  --dm_num_projectors 1 \
+  --dm_by_class true \
+  --dm_real_batch_size 4 \
+  --embed_value_clip 5.0
+```
+
+#### Regression smoke checks
+
+* Re-run either command with the same `--work_base_dir` and `--overwrite true`; fresh run state should be initialized each time.
+* Add `--print_full true --conversion_method topk --use_dm true` to the Adam command to verify top-k full printing does not raise `loss_dict` initialization errors.
+* For difficult ADMM runs, prefer `--drop_non_english_tokens true`, consider `--embed_value_clip 5.0`, and use `--force_float32_model true` if fp16/bf16 instability is suspected.
 
 ## Finetuning
 1. Obtain the synthetic data paths by running the `Print fine-tuning paths` section in the notebook `gradmm/Finetuning.ipynb`.
