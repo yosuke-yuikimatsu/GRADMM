@@ -42,7 +42,6 @@ from utilities import (
     set_all_seeds,
 )
 
-
 unused_tokens = None
 
 
@@ -62,17 +61,64 @@ def init_empty_run_state(args):
     return summary_metrics, pos_generations, neg_generations
 
 
-def _copy_prompt_embeddings(x_embeds, prompt_embeddings, prompt_len, first_prompt_end_index):
+def _copy_prompt_embeddings(
+    x_embeds, prompt_embeddings, prompt_len, first_prompt_end_index
+):
     with torch.no_grad():
         if isinstance(prompt_embeddings, list):
+            first_prompt_embeddings = (
+                prompt_embeddings[0]
+                .detach()
+                .to(device=x_embeds.device, dtype=x_embeds.dtype)
+            )
+            second_prompt_embeddings = (
+                prompt_embeddings[1]
+                .detach()
+                .to(device=x_embeds.device, dtype=x_embeds.dtype)
+            )
             x_embeds[
                 :,
                 first_prompt_end_index - prompt_len[0] : first_prompt_end_index,
                 :,
-            ].copy_(prompt_embeddings[0].detach())
-            x_embeds[:, -prompt_len[1] :, :].copy_(prompt_embeddings[1].detach())
+            ].copy_(first_prompt_embeddings)
+            x_embeds[:, -prompt_len[1] :, :].copy_(second_prompt_embeddings)
         else:
-            x_embeds[:, -prompt_len:, :].copy_(prompt_embeddings.detach())
+            prompt_embeddings = prompt_embeddings.detach().to(
+                device=x_embeds.device, dtype=x_embeds.dtype
+            )
+            x_embeds[:, -prompt_len:, :].copy_(prompt_embeddings)
+
+
+def _prepare_optimized_embeds(args, x_embeds, device):
+    if getattr(args, "optimize_embeds_float32", True):
+        x_embeds = x_embeds.detach().clone().float().to(device)
+        x_embeds.requires_grad_(True)
+    return x_embeds
+
+
+def _avg_embeds_for_loss(avg_embeds, x_embeds):
+    return avg_embeds.to(device=x_embeds.device, dtype=x_embeds.dtype)
+
+
+def _validate_and_clip_x_embeds_grad(args, x_embeds, step):
+    if x_embeds.grad is None:
+        raise FloatingPointError(
+            f"Missing x_embeds.grad before optimizer step, step={step}"
+        )
+    if not torch.isfinite(x_embeds.grad).all():
+        raise FloatingPointError(
+            "Non-finite x_embeds.grad before optimizer step, "
+            f"step={step}, shape={tuple(x_embeds.grad.shape)}"
+        )
+    if args.grad_clip is None:
+        return
+    grad_norm = x_embeds.grad.norm()
+    if not torch.isfinite(grad_norm):
+        raise FloatingPointError(
+            f"Non-finite x_embeds.grad norm before optimizer step, step={step}"
+        )
+    if grad_norm > args.grad_clip:
+        x_embeds.grad.mul_(args.grad_clip / (grad_norm + 1e-6))
 
 
 def _maybe_clip_embeddings(args, *tensors):
@@ -115,9 +161,7 @@ def get_loss(
     Returns:
         return_dict: Dictionary of losses
     """
-    perplexity = model(
-        input_ids=ids, attention_mask=attention_mask, labels=ids
-    ).loss
+    perplexity = model(input_ids=ids, attention_mask=attention_mask, labels=ids).loss
     rec_loss_embeds = get_reconstruction_loss(
         model,
         x_embeds,
@@ -144,7 +188,7 @@ def get_loss(
         return_grads=return_grads,
     )
     return_dict["embed_diff_ids"] = get_embed_diff(args, model, ids, avg_embeds)
-    
+
     if return_grads:
         rec_loss_ids, new_grad = rec_loss_ids[0], rec_loss_ids[1]
         return_dict["new_grad"] = new_grad
@@ -302,7 +346,7 @@ def generation(
         if token_candidates is not None:
             print(f"Number of used tokens: {len(token_candidates)}")
         unused_tokens = list(set(unused_tokens))
-        
+
         if args.drop_change_line_characters:
             print("Dropping change line characters")
             pattern = r"^[a-z]+(?:[\'-][a-z]+)*$"
@@ -321,7 +365,7 @@ def generation(
                 text_lower = re.sub(r"^\W+|\W+$", "", text_lower)
                 if not re.fullmatch(pattern, text_lower):
                     unused_tokens.append(token)
-  
+
     print(f"Number of unused tokens: {len(unused_tokens)}")
 
     if args.dataset in [
@@ -380,9 +424,7 @@ def generation(
         args.first_prompt_end_index = init_prompt_length
     else:
         print("Generating random initial embeddings.")
-        attention_mask = torch.ones(
-            gen_shape[0], gen_shape[1], device=device
-        ).long()
+        attention_mask = torch.ones(gen_shape[0], gen_shape[1], device=device).long()
         x_embeds = get_init_lm(
             args,
             model,
@@ -398,6 +440,8 @@ def generation(
         )
         args.first_prompt_end_index = args.gen_max_tokens
 
+    x_embeds = _prepare_optimized_embeds(args, x_embeds, device)
+    avg_embeds = _avg_embeds_for_loss(avg_embeds, x_embeds)
     assert_finite_tensor("x_embeds_init", x_embeds)
     lm_embeddings_weight = lm_embeddings.weight.unsqueeze(0)
 
@@ -434,9 +478,7 @@ def generation(
         opt = optim.Adam([x_embeds], lr=args.lr)
 
     if args.lr_decay_type == "StepLR":
-        lr_scheduler = optim.lr_scheduler.StepLR(
-            opt, step_size=50, gamma=args.lr_decay
-        )
+        lr_scheduler = optim.lr_scheduler.StepLR(opt, step_size=50, gamma=args.lr_decay)
     elif args.lr_decay_type == "LambdaLR":
 
         def lr_lambda(current_step: int):
@@ -461,7 +503,9 @@ def generation(
         args.n_steps = 0
 
     for it in range(args.n_steps):
-        _copy_prompt_embeddings(x_embeds, prompt_embeddings, prompt_len, args.first_prompt_end_index)
+        _copy_prompt_embeddings(
+            x_embeds, prompt_embeddings, prompt_len, args.first_prompt_end_index
+        )
         if (
             args.use_dm
             and args.dm_resample_every > 0
@@ -469,14 +513,16 @@ def generation(
             and it % args.dm_resample_every == 0
         ):
             dm_projectors = build_dm_projectors(args, x_embeds.shape[-1], device)
-        
+
         t_start = time.time()
         dm_loss_value = 0.0
         if args.opt_alg == "admm":
             # x + rho^-1 * lambda
             intermediate_embeds = x_embeds.detach().clone()
             intermediate_embeds.add_((1 / args.admm_rho) * lambda_embeds.detach())
-            assert_finite_tensor("admm_intermediate_embeds", intermediate_embeds, step=it)
+            assert_finite_tensor(
+                "admm_intermediate_embeds", intermediate_embeds, step=it
+            )
             if args.conversion_method == "topk":
                 _, z_ids = get_topk_closest_tokens(
                     intermediate_embeds,
@@ -523,7 +569,11 @@ def generation(
                 # print("prompt_ids.shape", prompt_ids.shape)
                 z_ids[:, -prompt_len:] = prompt_ids  # shape: (gen_tokens,)
             with torch.no_grad():
-                z_embeds.copy_(lm_embeddings(z_ids.unsqueeze(0)).detach())
+                z_embeds.copy_(
+                    lm_embeddings(z_ids.unsqueeze(0))
+                    .detach()
+                    .to(dtype=z_embeds.dtype, device=z_embeds.device)
+                )
             assert_finite_tensor("z_ids", z_ids, step=it)
             assert_finite_tensor("z_embeds", z_embeds, step=it)
 
@@ -544,20 +594,26 @@ def generation(
                         previous_grad=previous_grad,
                     )
                 norm_diff = (x_embeds.norm(p=2, dim=2).mean() - args.init_size).square()
-                
+
                 if args.reg_loss_type == "norm":
                     embed_diff = norm_diff
                 elif args.reg_loss_type == "embed":
                     if args.embed_loss == "cos":
-                        embed_diff = 1 - cos_sim(x_embeds.mean(dim=1), avg_embeds)
+                        avg_embeds_for_loss = _avg_embeds_for_loss(avg_embeds, x_embeds)
+                        embed_diff = 1 - cos_sim(
+                            x_embeds.mean(dim=1), avg_embeds_for_loss
+                        )
                     elif args.embed_loss == "dlg":
-                        embed_diff = (x_embeds.mean(dim=1) - avg_embeds).square().sum()
+                        avg_embeds_for_loss = _avg_embeds_for_loss(avg_embeds, x_embeds)
+                        embed_diff = (
+                            (x_embeds.mean(dim=1) - avg_embeds_for_loss).square().sum()
+                        )
                     else:
                         # No regularization
                         embed_diff = x_embeds.new_zeros(())
                 else:
                     embed_diff = x_embeds.new_zeros(())
-                
+
                 reg_loss = (
                     (x_embeds - z_embeds + (1 / args.admm_rho) * lambda_embeds)
                     .square()
@@ -602,23 +658,29 @@ def generation(
                 tot_loss.backward()
                 # print(f"----Inner ADMM step: total loss {tot_loss.item()}, rec_loss {rec_loss.item()}, admm_item {(args.admm_rho / 2) * reg_loss.item()}, embed_diff {args.coeff_reg * embed_diff}, perp loss {args.coeff_perplexity * perp_loss}")
                 if args.dataset in ["rotten_tomatoes", "imdb", "rtpolarity"]:
-                    x_embeds.grad[:, -prompt_len:, :] = 0.0
-                
-                with torch.no_grad():
-                    if args.grad_clip is not None:
-                        grad_norm = x_embeds.grad.norm()  # pytype: disable=attribute-error
-                        if grad_norm > args.grad_clip:
-                            x_embeds.grad.mul_(args.grad_clip / (grad_norm + 1e-6))  # pytype: disable=attribute-error
+                    if x_embeds.grad is not None:
+                        x_embeds.grad[:, -prompt_len:, :] = 0.0
 
-                return tot_loss, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss, dm_loss
+                with torch.no_grad():
+                    _validate_and_clip_x_embeds_grad(args, x_embeds, it)
+
+                return (
+                    tot_loss,
+                    rec_loss,
+                    reg_loss,
+                    norm_diff,
+                    embed_diff,
+                    perp_loss,
+                    dm_loss,
+                )
 
             for _ in range(args.admm_inner_steps):
-                error, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss, dm_loss = opt.step(
-                    closure
+                error, rec_loss, reg_loss, norm_diff, embed_diff, perp_loss, dm_loss = (
+                    opt.step(closure)
                 )
                 assert_finite_tensor("x_embeds_after_opt_step", x_embeds, step=it)
                 _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
-            
+
             # update lambda embeddings
             if args.conversion_method == "topk":
                 _, proj_ids = get_topk_closest_tokens(
@@ -663,7 +725,7 @@ def generation(
                 proj_ids[:, -prompt_len[1] :] = prompt_ids[1]
             else:
                 proj_ids[:, -prompt_len:] = prompt_ids  # shape: (gen_tokens,)
-            
+
             assert_finite_tensor("x_embeds_before_get_loss", x_embeds, step=it)
             loss_dict = get_loss(
                 args,
@@ -690,11 +752,14 @@ def generation(
                 f" perplexity = {loss_dict['perplexity'].item()}"
             )
             with torch.no_grad():
-                lambda_embeds.add_(args.admm_rho * (x_embeds.detach() - z_embeds.detach()))
+                lambda_embeds.add_(
+                    args.admm_rho * (x_embeds.detach() - z_embeds.detach())
+                )
             assert_finite_tensor("lambda_embeds_after_update", lambda_embeds, step=it)
             _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
             assert_finite_tensor("lambda_embeds", lambda_embeds, step=it)
         else:
+
             def closure():
                 nonlocal dm_loss_value
                 opt.zero_grad()
@@ -713,7 +778,8 @@ def generation(
                     )
                 norm_diff = (x_embeds.norm(p=2, dim=2).mean() - args.init_size).square()
                 if args.embed_loss == "cos":
-                    embed_diff = 1 - cos_sim(x_embeds.mean(dim=1), avg_embeds)
+                    avg_embeds_for_loss = _avg_embeds_for_loss(avg_embeds, x_embeds)
+                    embed_diff = 1 - cos_sim(x_embeds.mean(dim=1), avg_embeds_for_loss)
                 elif args.embed_loss == "cos_mapped_embeds":
                     if args.conversion_method == "topk":
                         _, proj_ids = get_topk_closest_tokens(
@@ -775,11 +841,14 @@ def generation(
                     #     f" cos_sim_reg: {cos_sim_reg.item()}"
                     # )
                 elif args.embed_loss == "dlg":
-                    embed_diff = (x_embeds.mean(dim=1) - avg_embeds).square().sum()
+                    avg_embeds_for_loss = _avg_embeds_for_loss(avg_embeds, x_embeds)
+                    embed_diff = (
+                        (x_embeds.mean(dim=1) - avg_embeds_for_loss).square().sum()
+                    )
                 else:
                     # Default case
                     embed_diff = torch.zeros_like(norm_diff)
-                
+
                 if args.reg_loss_type == "norm":
                     reg_loss = norm_diff
                 elif args.reg_loss_type == "embed":
@@ -815,17 +884,18 @@ def generation(
                 assert_finite_scalar("dm_loss", dm_loss, step=it)
                 tot_loss.backward(retain_graph=True)
                 with torch.no_grad():
-                    if args.grad_clip is not None:
-                        grad_norm = x_embeds.grad.norm()  # pytype: disable=attribute-error
-                        if grad_norm > args.grad_clip:
-                            x_embeds.grad.mul_(args.grad_clip / (grad_norm + 1e-6))  # pytype: disable=attribute-error
+                    _validate_and_clip_x_embeds_grad(args, x_embeds, it)
                 return tot_loss, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss
 
-            error, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss = opt.step(closure)
+            error, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss = opt.step(
+                closure
+            )
             assert_finite_tensor("x_embeds_after_opt_step", x_embeds, step=it)
             _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
 
-        _copy_prompt_embeddings(x_embeds, prompt_embeddings, prompt_len, args.first_prompt_end_index)
+        _copy_prompt_embeddings(
+            x_embeds, prompt_embeddings, prompt_len, args.first_prompt_end_index
+        )
         assert_finite_tensor("x_embeds_after_prompt_copy", x_embeds, step=it)
         if best_final_error is None or error <= best_final_error:
             best_final_error = error.item()
@@ -902,7 +972,9 @@ def generation(
                     _, cos_ids = get_closest_tokens(
                         x_embeds, unused_tokens, lm_embeddings_weight
                     )
-                assert_finite_tensor("x_embeds_before_print_get_loss", x_embeds, step=it)
+                assert_finite_tensor(
+                    "x_embeds_before_print_get_loss", x_embeds, step=it
+                )
                 loss_dict = get_loss(
                     args,
                     model,
@@ -1093,9 +1165,7 @@ MODEL_MAP = {
     "phi": "microsoft/phi-1_5",
 }
 
-LAST_LAYERS = [
-    "lm_head"
-]
+LAST_LAYERS = ["lm_head"]
 
 
 def get_gen_samples(args):
@@ -1119,7 +1189,7 @@ def get_gen_samples(args):
         n_fewshot=args.n_fewshot,
         seed=args.rng_seed,
     )
-    
+
     pos_sequences, neg_sequences = [], []
     pos_labels, neg_labels = [], []
     fewshot_seqs, fewshot_labels = [], []
@@ -1156,14 +1226,10 @@ def dp_cliped_per_sample_grads(args, per_sample_grads):
         flat_per_sample_grads_list.append(grads.view(-1))
     all_flat_per_sample_grads = torch.cat(flat_per_sample_grads_list)
     per_sample_total_norms = torch.norm(all_flat_per_sample_grads, p=2)
-    
+
     del all_flat_per_sample_grads
-    clipping_factors = (args.dp_c / (per_sample_total_norms + 1e-6)).clamp(
-        max=1.0
-    )
-    per_sample_grads = [
-        grads.mul_(clipping_factors) for grads in per_sample_grads
-    ]
+    clipping_factors = (args.dp_c / (per_sample_total_norms + 1e-6)).clamp(max=1.0)
+    per_sample_grads = [grads.mul_(clipping_factors) for grads in per_sample_grads]
 
     return per_sample_grads
 
@@ -1173,8 +1239,7 @@ def dp_add_noise(args, average_true_grads, batch_size):
     if args.dp_epsilon <= 1 and args.dp_epsilon >= 0:
         for grads in average_true_grads:
             std = (
-                (args.dp_c / batch_size)
-                * math.sqrt(2 * math.log(1.25 / args.dp_delta))
+                (args.dp_c / batch_size) * math.sqrt(2 * math.log(1.25 / args.dp_delta))
             ) / args.dp_epsilon
             noise = torch.normal(
                 mean=0,
@@ -1218,7 +1283,7 @@ def compute_list_embeds(args, model, tokenizer, sequences, labels):
     num_samples = len(sequences)
     text_labels = []
     prompt_lengths = []  # Collect prompt lengths for dataset with two prompts
-    
+
     if args.dataset in [
         "sst2",
         "rotten_tomatoes",
@@ -1284,7 +1349,7 @@ def compute_average_grads(args, model, tokenizer, sequences, labels):
     num_samples = len(sequences)
     text_labels = []
     prompt_lengths = []  # Collect prompt lengths for dataset with two prompts
-    
+
     if args.dataset in [
         "sst2",
         "rotten_tomatoes",
@@ -1348,7 +1413,7 @@ def compute_average_grads(args, model, tokenizer, sequences, labels):
             avg_true_embeds = true_embeds.detach().mean(dim=1) / num_samples
         else:
             avg_true_embeds.add_(true_embeds.detach().mean(dim=1) / num_samples)
-        
+
         list_true_embeds.append(true_embeds.detach().cpu())
         del curr_grads
         torch.cuda.empty_cache()
@@ -1404,13 +1469,17 @@ def main():
             print("Overwriting work directory...")
             shutil.rmtree(args.work_dir)
             set_all_seeds(args.rng_seed)
-            summary_metrics, pos_generations, neg_generations = init_empty_run_state(args)
+            summary_metrics, pos_generations, neg_generations = init_empty_run_state(
+                args
+            )
         else:
             print("Restoring RNG state ... ")
             if not os.path.exists(os.path.join(args.work_dir, "rng_states.pth")):
                 print("RNG state file not found. Starting from scratch.")
                 set_all_seeds(args.rng_seed)
-                summary_metrics, pos_generations, neg_generations = init_empty_run_state(args)
+                summary_metrics, pos_generations, neg_generations = (
+                    init_empty_run_state(args)
+                )
             else:
                 load_rng_states(args.work_dir)
                 # determine remaining n_gen
@@ -1436,7 +1505,7 @@ def main():
         print("Creating work directory: ", args.work_dir)
         set_all_seeds(args.rng_seed)
         summary_metrics, pos_generations, neg_generations = init_empty_run_state(args)
-    
+
     os.makedirs(args.work_dir, exist_ok=True)
     summary_metrics["args"] = vars(args)
     print("\n\n\nCommand:", " ".join(sys.argv), "\n\n\n", flush=True)
@@ -1476,7 +1545,7 @@ def main():
 
         assert len(named_parameters_to_optim) != 0, "no layer found"
         print(f"Set gradients for {len(named_parameters_to_optim)} layers")
-    
+
     model.generation_config.pad_token_id = pad_token_id
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = pad_token_id
@@ -1494,9 +1563,7 @@ def main():
     summary_metrics["pos_num_samples"] = len(pos_sequences)
     summary_metrics["neg_num_samples"] = len(neg_sequences)
 
-    with open(
-        os.path.join(args.work_dir, "real_train_data.jsonl"), "w"
-    ) as f:
+    with open(os.path.join(args.work_dir, "real_train_data.jsonl"), "w") as f:
         count = 0
         for seq, label in zip(pos_sequences, pos_labels):
             data = {"id": count, "inputs": seq, "label": label.item()}
@@ -1527,7 +1594,7 @@ def main():
             )["input_ids"].view(-1)
         for t in input_ids:
             token_candidates.add(t.item())
-        
+
         prompt_seq = [
             "\nIs the sentence grammatically acceptable? Answer:\n",
             "Yes",
@@ -1561,12 +1628,8 @@ def main():
         unique_prefixes = ["The"]
 
     # Create data loaders
-    pos_data_loader = BatchDatasetLoader(
-        pos_sequences, pos_labels, args.batch_size
-    )
-    neg_data_loader = BatchDatasetLoader(
-        neg_sequences, neg_labels, args.batch_size
-    )
+    pos_data_loader = BatchDatasetLoader(pos_sequences, pos_labels, args.batch_size)
+    neg_data_loader = BatchDatasetLoader(neg_sequences, neg_labels, args.batch_size)
 
     pos_previous_grad = None
     neg_previous_grad = None
@@ -1593,7 +1656,10 @@ def main():
         pos_sequences, pos_labels = next(pos_data_loader)
         neg_sequences, neg_labels = next(neg_data_loader)
         # Calculate average gradients & embeddings
-        if pos_true_grads is None or args.batch_size < summary_metrics["pos_num_samples"]:
+        if (
+            pos_true_grads is None
+            or args.batch_size < summary_metrics["pos_num_samples"]
+        ):
             print("Calculating average gradients for positive samples.")
             (
                 pos_true_grads,
@@ -1601,14 +1667,15 @@ def main():
                 pos_avg_embeds,
                 pos_prompt_lengths,
                 pos_closest_index,
-            ) = compute_average_grads(
-                args, model, tokenizer, pos_sequences, pos_labels
-            )
+            ) = compute_average_grads(args, model, tokenizer, pos_sequences, pos_labels)
         else:
             pos_true_embeds, pos_prompt_lengths = compute_list_embeds(
                 args, model, tokenizer, pos_sequences, pos_labels
             )
-        if neg_true_grads is None or args.batch_size < summary_metrics["neg_num_samples"]:
+        if (
+            neg_true_grads is None
+            or args.batch_size < summary_metrics["neg_num_samples"]
+        ):
             print("Calculating average gradients for negative samples.")
             (
                 neg_true_grads,
@@ -1616,25 +1683,19 @@ def main():
                 neg_avg_embeds,
                 neg_prompt_lengths,
                 neg_closest_index,
-            ) = compute_average_grads(
-                args, model, tokenizer, neg_sequences, neg_labels
-            )
+            ) = compute_average_grads(args, model, tokenizer, neg_sequences, neg_labels)
         else:
             neg_true_embeds, neg_prompt_lengths = compute_list_embeds(
                 args, model, tokenizer, neg_sequences, neg_labels
             )
         # Save the average gradients for the positive and negative samples.
         if args.save_avg_grad:
-            with open(
-                os.path.join(args.work_dir, "pos_avg_grads.pkl"), "wb"
-            ) as f:
+            with open(os.path.join(args.work_dir, "pos_avg_grads.pkl"), "wb") as f:
                 torch.save(pos_true_grads, f)
-            with open(
-                os.path.join(args.work_dir, "neg_avg_grads.pkl"), "wb"
-            ) as f:
+            with open(os.path.join(args.work_dir, "neg_avg_grads.pkl"), "wb") as f:
                 torch.save(neg_true_grads, f)
             sys.exit(0)
-        
+
         if args.init == "real_first":
             pos_true_embed_index = 0
             neg_true_embed_index = 0
@@ -1644,7 +1705,7 @@ def main():
         else:
             pos_true_embed_index = np.random.randint(len(pos_true_embeds))
             neg_true_embed_index = np.random.randint(len(neg_true_embeds))
-        
+
         # Initialization
         pos_init = pos_sequences[pos_true_embed_index]
         pos_init_embed = pos_true_embeds[pos_true_embed_index]
@@ -1663,7 +1724,7 @@ def main():
         pos_init_sequences.append(pos_sequences[pos_true_embed_index])
         neg_init_sequences.append(neg_sequences[neg_true_embed_index])
         print("Positive average sequence length", np.mean(pos_prompt_lengths))
-        
+
         # Positive generation
         if args.use_auto_gen_tokens:
             args.gen_max_tokens = int(np.mean(pos_prompt_lengths))
@@ -1758,21 +1819,13 @@ def main():
         if args.save_every > 0 and i % args.save_every == 0:
             save_rng_states(args.work_dir)
             # save pos_generations and neg_generations and summary_metrics to pkl
-            with open(
-                os.path.join(args.work_dir, "pos_generations.pkl"), "wb"
-            ) as f:
+            with open(os.path.join(args.work_dir, "pos_generations.pkl"), "wb") as f:
                 pickle.dump(pos_generations, f)
-            with open(
-                os.path.join(args.work_dir, "neg_generations.pkl"), "wb"
-            ) as f:
+            with open(os.path.join(args.work_dir, "neg_generations.pkl"), "wb") as f:
                 pickle.dump(neg_generations, f)
-            with open(
-                os.path.join(args.work_dir, "summary_metrics.pkl"), "wb"
-            ) as f:
+            with open(os.path.join(args.work_dir, "summary_metrics.pkl"), "wb") as f:
                 pickle.dump(summary_metrics, f)
-            with open(
-                os.path.join(args.work_dir, "synthetic_data.jsonl"), "w"
-            ) as f:
+            with open(os.path.join(args.work_dir, "synthetic_data.jsonl"), "w") as f:
                 count = 0
                 for gen in pos_generations:
                     if type(gen["inputs"]) == list:
@@ -1835,21 +1888,13 @@ def main():
     summary_metrics["mean_rec_loss_embeds"] = np.mean(
         summary_metrics["rec_loss_embeds"]
     )
-    summary_metrics["mean_rec_loss_ids"] = np.mean(
-        summary_metrics["rec_loss_ids"]
-    )
+    summary_metrics["mean_rec_loss_ids"] = np.mean(summary_metrics["rec_loss_ids"])
     summary_metrics["mean_tot_loss"] = np.mean(summary_metrics["tot_loss"])
-    summary_metrics["mean_embed_diff_ids"] = np.mean(
-        summary_metrics["embed_diff_ids"]
-    )
-    with open(
-        os.path.join(args.work_dir, "summary_metrics.json"), "w"
-    ) as f:
+    summary_metrics["mean_embed_diff_ids"] = np.mean(summary_metrics["embed_diff_ids"])
+    with open(os.path.join(args.work_dir, "summary_metrics.json"), "w") as f:
         print("Writing summary metrics...")
         f.write(json.dumps(summary_metrics, indent=2))
-    with open(
-        os.path.join(args.work_dir, "synthetic_data.jsonl"), "w"
-    ) as f:
+    with open(os.path.join(args.work_dir, "synthetic_data.jsonl"), "w") as f:
         count = 0
         for gen in pos_generations:
             if type(gen["inputs"]) == list:
@@ -1908,9 +1953,7 @@ def main():
                 f.write(json.dumps(data) + "\n")
                 count += 1
     # Save real init data
-    with open(
-        os.path.join(args.work_dir, "real_init_data.jsonl"), "w"
-    ) as f:
+    with open(os.path.join(args.work_dir, "real_init_data.jsonl"), "w") as f:
         count = 0
         for seq in pos_init_sequences:
             data = {"id": count, "inputs": seq, "label": 1}

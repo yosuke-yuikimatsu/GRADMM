@@ -66,7 +66,7 @@ python generate.py \
 
 ### Stable DM smoke tests
 
-These checks are ordered from cheapest to most numerically demanding. The stabilizing flags are optional and are mainly intended for debugging: `--force_float32_model true` loads the language model in fp32 and may require more VRAM, while `--embed_value_clip` clamps ADMM embedding variables after updates.
+These checks are ordered from cheapest to most numerically demanding. Synthetic embeddings are optimized as fp32 leaf tensors by default (`--optimize_embeds_float32 true`) even when the language model forward runs in fp16/bf16; `align_embeds_to_model` still casts embeddings to the LM dtype for forward compatibility while preserving gradients to the fp32 optimization variable. The stabilizing flags are optional and are mainly intended for debugging: `--force_float32_model true` loads the language model in fp32 and may require more VRAM, while `--embed_value_clip` clamps ADMM embedding variables after updates.
 
 #### A. CPU unit tests
 
