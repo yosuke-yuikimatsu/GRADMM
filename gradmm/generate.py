@@ -98,6 +98,26 @@ def _copy_prompt_embeddings(
             x_embeds[:, -prompt_len:, :].copy_(prompt_embeddings)
 
 
+def _add_real_noise(args, x_embeds, prompt_len, first_prompt_end_index):
+    real_noise_std = getattr(args, "real_noise_std", 0.0)
+    if real_noise_std <= 0:
+        return x_embeds
+
+    noise = real_noise_std * torch.randn_like(x_embeds)
+
+    # Keep fixed prompt embeddings unchanged; optimization later re-copies the same
+    # slices, so the noisy initialization should not perturb them either.
+    if isinstance(prompt_len, list):
+        noise[
+            :, first_prompt_end_index - prompt_len[0] : first_prompt_end_index, :
+        ] = 0.0
+        noise[:, -prompt_len[1] :, :] = 0.0
+    else:
+        noise[:, first_prompt_end_index - prompt_len : first_prompt_end_index, :] = 0.0
+
+    return x_embeds + noise
+
+
 def _prepare_optimized_embeds(args, x_embeds, device):
     if getattr(args, "optimize_embeds_float32", True):
         x_embeds = x_embeds.detach().clone().float().to(device)
@@ -426,11 +446,19 @@ def generation(
         print(f"Using real embeddings with shape {init_embeds.shape}.")
         # Note that init_embeds already has the prompt embeddings.
         x_embeds = init_embeds.clone()
-        x_embeds.requires_grad_(True)
         attention_mask = torch.ones(
             x_embeds.shape[0], x_embeds.shape[1], device=device
         ).long()
         args.first_prompt_end_index = init_prompt_length
+        if args.init == "real_noisy":
+            print(
+                "Adding Gaussian noise to real embeddings "
+                f"with std={args.real_noise_std}."
+            )
+            x_embeds = _add_real_noise(
+                args, x_embeds, prompt_len, args.first_prompt_end_index
+            )
+        x_embeds.requires_grad_(True)
     else:
         print("Generating random initial embeddings.")
         attention_mask = torch.ones(gen_shape[0], gen_shape[1], device=device).long()
@@ -1749,7 +1777,7 @@ def main():
         if args.init == "real_first":
             pos_true_embed_index = 0
             neg_true_embed_index = 0
-        elif args.init == "real_closest":
+        elif args.init in ["real_closest", "real_noisy"]:
             pos_true_embed_index = pos_closest_index
             neg_true_embed_index = neg_closest_index
         else:
