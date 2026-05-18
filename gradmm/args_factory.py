@@ -58,9 +58,16 @@ def get_args(argv=None):
     parser.add_argument("--init_candidates", type=int, default=500)  #
     parser.add_argument(
         "--init",
-        choices=["real_first", "real_closest", "random_normal", "random_embed"],
+        choices=[
+            "real_first",
+            "real_closest",
+            "real_noisy",
+            "random_normal",
+            "random_embed",
+        ],
         default="random_normal",
     )
+    parser.add_argument("--real_noise_std", type=float, default=0.03)
     parser.add_argument("--init_size", type=float, default=1.4)  #
     parser.add_argument(
         "--lr_decay_type",
