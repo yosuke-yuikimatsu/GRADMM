@@ -624,11 +624,13 @@ def generation(
                 else:
                     embed_diff = x_embeds.new_zeros(())
 
-                reg_loss = (
-                    (x_embeds - z_embeds + (1 / args.admm_rho) * lambda_embeds)
-                    .square()
-                    .sum()
+                admm_residual = (
+                    x_embeds - z_embeds + (1 / args.admm_rho) * lambda_embeds
                 )
+                if args.admm_reg_reduction == "mean":
+                    reg_loss = admm_residual.square().mean()
+                else:
+                    reg_loss = admm_residual.square().sum()
                 # perplexity loss
                 perp_loss = get_perplexity_loss(x_embeds, z_ids, model)
                 dm_loss = x_embeds.new_zeros(())
@@ -750,6 +752,20 @@ def generation(
                 avg_embeds,
                 previous_grad=previous_grad,
             )
+            if args.admm_select_by == "rec_loss_ids":
+                candidate_error = loss_dict["rec_loss_ids"].detach().item()
+            elif args.admm_select_by == "rec_loss_embeds":
+                candidate_error = loss_dict["rec_loss_embeds"].detach().item()
+            elif args.admm_select_by == "mixed":
+                candidate_error = (
+                    loss_dict["rec_loss_ids"]
+                    + args.coeff_perplexity * loss_dict["perplexity"]
+                ).detach().item()
+            else:
+                candidate_error = (
+                    error.detach().item() if torch.is_tensor(error) else float(error)
+                )
+            lambda_norm = lambda_embeds.norm().item()
             print(
                 f"--ADMM DEBUG: iter {it} |x - z|^2 ="
                 f" {(x_embeds - z_embeds).square().sum().item()}, rec_loss ="
@@ -760,11 +776,29 @@ def generation(
                 f" rec_loss_embeds = {loss_dict['rec_loss_embeds'].item()}"
                 f" rec_loss_ids = {loss_dict['rec_loss_ids'].item()}"
                 f" perplexity = {loss_dict['perplexity'].item()}"
+                f" lambda_norm = {lambda_norm}"
+                f" candidate_error = {candidate_error}"
+                f" admm_reg_reduction = {args.admm_reg_reduction}"
+                f" admm_dual_step = {args.admm_dual_step}"
             )
             with torch.no_grad():
                 lambda_embeds.add_(
-                    args.admm_rho * (x_embeds.detach() - z_embeds.detach())
+                    args.admm_dual_step
+                    * args.admm_rho
+                    * (x_embeds.detach() - z_embeds.detach())
                 )
+                if (
+                    args.admm_lambda_max_norm is not None
+                    and args.admm_lambda_max_norm > 0
+                ):
+                    lambda_norm = lambda_embeds.norm()
+                    if (
+                        torch.isfinite(lambda_norm)
+                        and lambda_norm > args.admm_lambda_max_norm
+                    ):
+                        lambda_embeds.mul_(
+                            args.admm_lambda_max_norm / (lambda_norm + 1e-6)
+                        )
             assert_finite_tensor("lambda_embeds_after_update", lambda_embeds, step=it)
             _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
             assert_finite_tensor("lambda_embeds", lambda_embeds, step=it)
@@ -903,6 +937,9 @@ def generation(
             error, norm_diff, embed_diff, rec_loss, reg_loss, dm_loss = opt.step(
                 closure
             )
+            candidate_error = (
+                error.detach().item() if torch.is_tensor(error) else float(error)
+            )
             assert_finite_tensor("x_embeds_after_opt_step", x_embeds, step=it)
             _maybe_clip_embeddings(args, x_embeds, z_embeds, lambda_embeds)
 
@@ -910,8 +947,8 @@ def generation(
             x_embeds, prompt_embeddings, prompt_len, args.first_prompt_end_index
         )
         assert_finite_tensor("x_embeds_after_prompt_copy", x_embeds, step=it)
-        if best_final_error is None or error <= best_final_error:
-            best_final_error = error.item()
+        if best_final_error is None or candidate_error <= best_final_error:
+            best_final_error = candidate_error
             best_norm_diff = norm_diff.item() if norm_diff is not None else 0.0
             best_embed_diff = embed_diff.item() if embed_diff is not None else 0.0
             best_rec_loss = rec_loss.item()

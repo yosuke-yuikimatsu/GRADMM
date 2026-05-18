@@ -84,6 +84,30 @@ def get_args(argv=None):
     parser.add_argument(
         "--admm_inner_steps", type=int, default=10
     )  # Possible range 10 - 200
+    parser.add_argument(
+        "--admm_reg_reduction",
+        choices=["sum", "mean"],
+        default="mean",
+        help="Reduction for ADMM quadratic penalty. Use mean for numerically stable scale.",
+    )
+    parser.add_argument(
+        "--admm_dual_step",
+        type=float,
+        default=0.1,
+        help="Damping factor for ADMM dual variable update.",
+    )
+    parser.add_argument(
+        "--admm_lambda_max_norm",
+        type=float,
+        default=100.0,
+        help="Optional max norm for ADMM dual variable. Use <=0 to disable.",
+    )
+    parser.add_argument(
+        "--admm_select_by",
+        choices=["augmented", "rec_loss_ids", "rec_loss_embeds", "mixed"],
+        default="mixed",
+        help="Criterion for selecting best candidate in ADMM.",
+    )
     parser.add_argument("--tag_factor", type=float, default=None)  # TAG best: 1e-3
     parser.add_argument(
         "--grad_clip", type=float, default=None
